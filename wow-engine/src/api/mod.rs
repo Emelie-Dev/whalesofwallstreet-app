@@ -1,46 +1,29 @@
-use crate::anchor::tracker::TrackerStore;
 use crate::anchor::{sep24::Sep24Client, sep38::Sep38Client, Sep24InteractiveResponse, Sep38Quote};
-use crate::bridge::attestation::AttestationError;
-use crate::bridge::cctp::CctpClient;
-use crate::bridge::gas_oracle::GasOracle;
 use crate::bridge::Chain;
-use crate::cache_sync::{ClusterCache, InvalidationMessage};
-use crate::config::AppConfig;
 use crate::db::models::RouteExecutionInput;
 use crate::db::service::{ExecuteRouteResult, RouteExecutionService};
 use crate::db::Database;
 use crate::error::AppError;
-use crate::router::slippage::SlippageError;
 use crate::router::{RouteOption, RoutePlanner};
 use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
-use tower_http::timeout::TimeoutLayer;
-
-/// Default per-request timeout applied when [`create_router`] is used without an
-/// explicit value. Kept in sync with [`crate::config::AppConfig`]'s default.
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+use uuid::Uuid;
 
 pub mod auth;
-pub mod middleware;
-pub mod validated_request;
 pub mod validation;
 use auth::SignatureVerifier;
-use validated_request::{
-    ValidatedAnchorQuoteRequest, ValidatedDepositRequest, ValidatedExecuteRouteRequest,
-    ValidatedQuoteRequest, ValidatedWithdrawRequest,
-};
-use validation::validate_anchor_domain;
+use validation::{validate_asset_code, validate_stellar_address};
 
-#[derive(Serialize)]
-pub struct ConfigResponse {
-    pub chains: Vec<&'static str>,
-    pub assets: Vec<&'static str>,
-    pub bridges: Vec<&'static str>,
+#[derive(Deserialize, Debug)]
+pub struct QuoteRequest {
+    pub source_chain: Chain,
+    pub dest_chain: Chain,
+    pub source_asset: String,
+    pub dest_asset: String,
+    pub amount_in: u64,
 }
 
 #[derive(Serialize)]
@@ -49,22 +32,41 @@ pub struct QuoteResponse {
 }
 
 #[derive(Deserialize, Debug)]
-pub struct VerifyAttestationRequest {
-    /// Chain the mint will execute on; the expected CCTP destination domain
-    /// is derived from this per request.
-    pub dest_chain: Chain,
-    /// Raw `MessageTransmitter` message, hex encoded (0x prefix optional).
-    pub message: String,
-    /// Concatenated 65-byte attester signatures, hex encoded.
-    pub attestation: String,
+pub struct DepositRequest {
+    pub anchor_domain: String,
+    pub asset_code: String,
+    pub account: String,
 }
 
-#[derive(Serialize)]
-pub struct VerifyAttestationResponse {
-    pub verified: bool,
-    pub source_domain: u32,
-    pub destination_domain: u32,
-    pub nonce: u64,
+#[derive(Deserialize, Debug)]
+pub struct WithdrawRequest {
+    pub anchor_domain: String,
+    pub asset_code: String,
+    pub account: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct AnchorQuoteRequest {
+    pub anchor_domain: String,
+    pub sell_asset: String,
+    pub buy_asset: String,
+    pub sell_amount: f64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ExecuteRouteRequest {
+    pub user_id: Uuid,
+    pub source_chain: String,
+    pub dest_chain: String,
+    pub source_asset: String,
+    pub dest_asset: String,
+    pub amount_in: u64,
+    pub amount_out: u64,
+    pub provider: String,
+    pub path: String,
+    pub estimated_fee_usd: f64,
+    pub anchor_domain: Option<String>,
+    pub anchor_transaction_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -75,29 +77,6 @@ pub struct HealthResponse {
     pub timestamp: String,
 }
 
-/// Body for `POST /api/v1/admin/invalidate-cache`.
-///
-/// Not on [`auth::PUBLIC_PATHS`], so it requires a valid request signature
-/// whenever one is configured — see the module docs on [`auth`].
-#[derive(Deserialize, Debug, Default)]
-pub struct InvalidateCacheRequest {
-    /// Evict only this chain's cached entry. Omit (or send `null`) to
-    /// invalidate every cached entry, e.g. for an emergency-pause reset.
-    #[serde(default)]
-    pub chain: Option<Chain>,
-}
-
-#[derive(Serialize)]
-pub struct InvalidateCacheResponse {
-    /// `"chain"` or `"all"`, describing what was evicted locally.
-    pub invalidated: &'static str,
-    /// Whether the invalidation was also broadcast to the rest of the
-    /// cluster over Redis. `false` when Redis isn't configured or is
-    /// currently unreachable — the local eviction above still applies either
-    /// way.
-    pub broadcast: bool,
-}
-
 /// Builds the application router.
 ///
 /// `db` injects the (optional) database used by `/execute-route`. `verifier`
@@ -105,253 +84,157 @@ pub struct InvalidateCacheResponse {
 /// except the public allowlist ([`auth::PUBLIC_PATHS`]) requires a valid
 /// signature; when `None`, verification is disabled entirely (intended only for
 /// local development — see `main`, which warns loudly in that case).
-pub fn create_router(
-    db: Option<Database>,
-    verifier: Option<SignatureVerifier>,
-    tracker: Option<Arc<TrackerStore>>,
-) -> Router {
-    create_router_with_timeout(db, verifier, tracker, DEFAULT_REQUEST_TIMEOUT)
-}
-
-/// Like [`create_router`], but with an explicit per-request timeout.
-///
-/// Builds a purely local [`ClusterCache`] (no Redis connectivity) — use
-/// [`create_router_with_cache`] to wire up cluster-wide cache invalidation.
-pub fn create_router_with_timeout(
-    db: Option<Database>,
-    verifier: Option<SignatureVerifier>,
-    tracker: Option<Arc<TrackerStore>>,
-    request_timeout: Duration,
-) -> Router {
-    let config = Arc::new(AppConfig::default());
-    create_router_with_cache(
-        db,
-        verifier,
-        tracker,
-        request_timeout,
-        ClusterCache::local_only(),
-        config,
-    )
-}
-
-/// Like [`create_router_with_timeout`], but with an explicit, caller-supplied
-/// [`ClusterCache`].
-///
-/// Production wiring (see `main`) builds one long-lived `ClusterCache` at
-/// startup — sharing a single [`crate::bridge::gas_oracle::GasOracle`] (and,
-/// when `REDIS_URL` is configured, a cluster-invalidation broadcaster) across
-/// every request — and passes it in here instead of letting each request
-/// build its own throwaway cache that a Redis invalidation message would have
-/// nothing to act on.
-pub fn create_router_with_cache(
-    db: Option<Database>,
-    verifier: Option<SignatureVerifier>,
-    tracker: Option<Arc<TrackerStore>>,
-    request_timeout: Duration,
-    cache: ClusterCache,
-    config: Arc<AppConfig>,
-) -> Router {
+pub fn create_router(db: Option<Database>, verifier: Option<SignatureVerifier>) -> Router {
     let router = Router::new()
         .route("/api/v1/health", get(health_handler))
-        .route(
-            "/api/v1/config",
-            get(config_handler).layer(axum::middleware::from_fn(middleware::etag_middleware)),
-        )
         .route("/api/v1/quote", post(quote_handler))
         .route("/api/v1/execute-route", post(execute_route_handler))
         .route("/api/v1/anchor/deposit", post(deposit_handler))
         .route("/api/v1/anchor/withdraw", post(withdraw_handler))
         .route("/api/v1/anchor/quote", post(anchor_quote_handler))
-        .route(
-            "/api/v1/admin/invalidate-cache",
-            post(admin_invalidate_cache_handler),
-        )
-        .route(
-            "/api/v1/cctp/verify-attestation",
-            post(verify_attestation_handler),
-        )
-        .layer(Extension(db))
-        .layer(Extension(cache))
-        .layer(Extension(config))
-        .layer(Extension(tracker));
+        .layer(Extension(db));
 
-    let router = match verifier {
+    // The signature layer is added last so it runs *first* — verification
+    // happens before any handler (or its body extractor) sees the request.
+    match verifier {
         Some(verifier) => router.layer(axum::middleware::from_fn_with_state(
             verifier,
             auth::verify_signature,
         )),
         None => router,
-    };
-
-    router.layer(TimeoutLayer::new(request_timeout))
-}
-
-/// Shared CCTP client so the attester-key cache and the durable nonce store
-/// are consistent across requests instead of being rebuilt per call.
-fn cctp_client(config: &Arc<AppConfig>) -> &'static CctpClient {
-    // Safety: This leaks a small, bounded allocation for the lifetime of the
-    // process. The alternative (tokio::sync::OnceCell per-config) would
-    // require the config to be `'static` and thread-safe at every call site.
-    // The leak is intentional and documented.
-    //
-    // NOTE: This approach only works when the config is identical across all
-    // callers (which it is — it's the same env vars). If per-request config
-    // divergence is ever needed, replace with an Extension.
-    static CCTP_CLIENT: OnceLock<CctpClient> = OnceLock::new();
-    CCTP_CLIENT.get_or_init(|| {
-        let oracle = Arc::new(GasOracle::new(config.clone()));
-        CctpClient::new(oracle, config.clone())
-    })
-}
-
-fn decode_hex_field(value: &str, field: &str) -> Result<Vec<u8>, AppError> {
-    hex::decode(value.trim_start_matches("0x"))
-        .map_err(|err| AppError::BadRequest(format!("Invalid hex in {field}: {err}")))
-}
-
-/// Gate that must pass before a CCTP bridge leg proceeds to the mint: the
-/// attestation is verified locally and cryptographically instead of trusting
-/// Circle's centralized API.
-#[tracing::instrument(err)]
-async fn verify_attestation_handler(
-    Extension(config): Extension<Arc<AppConfig>>,
-    Json(payload): Json<VerifyAttestationRequest>,
-) -> Result<Json<VerifyAttestationResponse>, AppError> {
-    let message = decode_hex_field(&payload.message, "message")?;
-    let attestation = decode_hex_field(&payload.attestation, "attestation")?;
-
-    let parsed = cctp_client(&config)
-        .verify_attestation(payload.dest_chain, &message, &attestation)
-        .await
-        .map_err(|err| match err {
-            // Infrastructure faults are server-side errors; everything else
-            // is a property of the submitted attestation.
-            AttestationError::KeySourceUnavailable | AttestationError::NonceStoreUnavailable(_) => {
-                AppError::Internal(anyhow::Error::new(err))
-            }
-            other => AppError::BadRequest(format!("Attestation rejected: {other}")),
-        })?;
-
-    Ok(Json(VerifyAttestationResponse {
-        verified: true,
-        source_domain: parsed.source_domain,
-        destination_domain: parsed.destination_domain,
-        nonce: parsed.nonce,
-    }))
+    }
 }
 
 async fn health_handler() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "wow-engine",
-        version: env!("CARGO_PKG_VERSION"),
+        version: "0.1.0",
         timestamp: chrono::Utc::now().to_rfc3339(),
     })
 }
 
-async fn config_handler() -> Json<ConfigResponse> {
-    Json(ConfigResponse {
-        chains: vec!["Ethereum", "Arbitrum", "Solana", "Stellar"],
-        assets: vec!["ETH", "USDC", "SOL", "XLM"],
-        bridges: vec!["deBridge", "CCTP"],
-    })
-}
+#[tracing::instrument(err)]
+async fn quote_handler(Json(payload): Json<QuoteRequest>) -> Result<Json<QuoteResponse>, AppError> {
+    if payload.source_asset.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Source asset cannot be empty".to_string(),
+        ));
+    }
+    if payload.dest_asset.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Destination asset cannot be empty".to_string(),
+        ));
+    }
+    if payload.amount_in == 0 {
+        return Err(AppError::BadRequest(
+            "Amount in must be greater than zero".to_string(),
+        ));
+    }
 
-#[tracing::instrument(skip(cache, config), err)]
-async fn quote_handler(
-    Extension(cache): Extension<ClusterCache>,
-    Extension(config): Extension<Arc<AppConfig>>,
-    Json(req): Json<ValidatedQuoteRequest>,
-) -> Result<Json<QuoteResponse>, AppError> {
-    req.validate()?;
-    let planner = RoutePlanner::with_gas_oracle(cache.gas_oracle.clone(), config);
+    let planner = RoutePlanner::new();
     let routes = planner
         .find_best_route(
-            req.source_chain,
-            req.dest_chain,
-            &req.source_asset,
-            &req.dest_asset,
-            req.amount_in,
+            payload.source_chain,
+            payload.dest_chain,
+            &payload.source_asset,
+            &payload.dest_asset,
+            payload.amount_in,
+            false,
         )
-        .await
-        .map_err(|err| {
-            if err.downcast_ref::<SlippageError>().is_some() {
-                AppError::BadRequest(err.to_string())
-            } else {
-                AppError::Internal(err)
-            }
-        })?;
+        .await?;
     Ok(Json(QuoteResponse { routes }))
 }
 
-#[tracing::instrument(skip(config, tracker), err)]
+#[tracing::instrument(err)]
 async fn deposit_handler(
-    Extension(config): Extension<Arc<AppConfig>>,
-    tracker: Extension<Option<Arc<TrackerStore>>>,
-    ValidatedDepositRequest {
-        anchor_domain,
-        asset_code,
-        account,
-    }: ValidatedDepositRequest,
+    Json(payload): Json<DepositRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
-    let valid_domain = validate_anchor_domain(&anchor_domain, &config.allowed_anchor_domains)
-        .map_err(AppError::BadRequest)?;
+    if let Err(err) = validate_stellar_address(&payload.account) {
+        return Err(AppError::BadRequest(format!(
+            "Invalid account address: {}",
+            err
+        )));
+    }
+    if let Err(err) = validate_asset_code(&payload.asset_code) {
+        return Err(AppError::BadRequest(format!("Invalid asset code: {}", err)));
+    }
+    if payload.anchor_domain.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Anchor domain cannot be empty".to_string(),
+        ));
+    }
 
-    let tracker = tracker.0.ok_or_else(|| {
-        AppError::Internal(anyhow::anyhow!(
-            "Database not configured for anchor tracker"
-        ))
-    })?;
-
-    let client = Sep24Client::new(tracker);
+    let client = Sep24Client::new();
     let tx = client
-        .initiate_deposit(&valid_domain, &asset_code, &account)
+        .initiate_deposit(
+            &payload.anchor_domain,
+            &payload.asset_code,
+            &payload.account,
+        )
         .await?;
     Ok(Json(tx))
 }
 
-#[tracing::instrument(skip(config, tracker), err)]
+#[tracing::instrument(err)]
 async fn withdraw_handler(
-    Extension(config): Extension<Arc<AppConfig>>,
-    tracker: Extension<Option<Arc<TrackerStore>>>,
-    ValidatedWithdrawRequest {
-        anchor_domain,
-        asset_code,
-        account,
-    }: ValidatedWithdrawRequest,
+    Json(payload): Json<WithdrawRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
-    let valid_domain = validate_anchor_domain(&anchor_domain, &config.allowed_anchor_domains)
-        .map_err(AppError::BadRequest)?;
+    if let Err(err) = validate_stellar_address(&payload.account) {
+        return Err(AppError::BadRequest(format!(
+            "Invalid account address: {}",
+            err
+        )));
+    }
+    if let Err(err) = validate_asset_code(&payload.asset_code) {
+        return Err(AppError::BadRequest(format!("Invalid asset code: {}", err)));
+    }
+    if payload.anchor_domain.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Anchor domain cannot be empty".to_string(),
+        ));
+    }
 
-    let tracker = tracker.0.ok_or_else(|| {
-        AppError::Internal(anyhow::anyhow!(
-            "Database not configured for anchor tracker"
-        ))
-    })?;
-
-    let client = Sep24Client::new(tracker);
+    let client = Sep24Client::new();
     let tx = client
-        .initiate_withdrawal(&valid_domain, &asset_code, &account)
+        .initiate_withdrawal(
+            &payload.anchor_domain,
+            &payload.asset_code,
+            &payload.account,
+        )
         .await?;
     Ok(Json(tx))
 }
 
-#[tracing::instrument(skip(config), err)]
+#[tracing::instrument(err)]
 async fn anchor_quote_handler(
-    Extension(config): Extension<Arc<AppConfig>>,
-    ValidatedAnchorQuoteRequest {
-        anchor_domain,
-        sell_asset,
-        buy_asset,
-        sell_amount,
-    }: ValidatedAnchorQuoteRequest,
+    Json(payload): Json<AnchorQuoteRequest>,
 ) -> Result<Json<Sep38Quote>, AppError> {
-    let valid_domain = validate_anchor_domain(&anchor_domain, &config.allowed_anchor_domains)
-        .map_err(AppError::BadRequest)?;
+    if let Err(err) = validate_asset_code(&payload.sell_asset) {
+        return Err(AppError::BadRequest(format!("Invalid sell asset: {}", err)));
+    }
+    if let Err(err) = validate_asset_code(&payload.buy_asset) {
+        return Err(AppError::BadRequest(format!("Invalid buy asset: {}", err)));
+    }
+    if payload.sell_amount <= 0.0 {
+        return Err(AppError::BadRequest(
+            "Sell amount must be greater than zero".to_string(),
+        ));
+    }
+    if payload.anchor_domain.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Anchor domain cannot be empty".to_string(),
+        ));
+    }
 
     let client = Sep38Client::new();
     let quote = client
-        .get_indicative_quote(&valid_domain, &sell_asset, &buy_asset, sell_amount)
+        .get_indicative_quote(
+            &payload.anchor_domain,
+            &payload.sell_asset,
+            &payload.buy_asset,
+            payload.sell_amount,
+        )
         .await?;
     Ok(Json(quote))
 }
@@ -359,20 +242,7 @@ async fn anchor_quote_handler(
 #[tracing::instrument(skip(db), err)]
 async fn execute_route_handler(
     Extension(db): Extension<Option<Database>>,
-    ValidatedExecuteRouteRequest {
-        user_id,
-        source_chain,
-        dest_chain,
-        source_asset,
-        dest_asset,
-        amount_in,
-        amount_out,
-        provider,
-        path,
-        estimated_fee_usd,
-        anchor_domain,
-        anchor_transaction_id,
-    }: ValidatedExecuteRouteRequest,
+    Json(payload): Json<ExecuteRouteRequest>,
 ) -> Result<Json<ExecuteRouteResult>, AppError> {
     let db = db.ok_or_else(|| {
         AppError::Internal(anyhow::anyhow!(
@@ -380,87 +250,69 @@ async fn execute_route_handler(
         ))
     })?;
 
+    if payload.amount_in == 0 {
+        return Err(AppError::BadRequest(
+            "Amount in must be greater than zero".to_string(),
+        ));
+    }
+    if payload.amount_out == 0 {
+        return Err(AppError::BadRequest(
+            "Amount out must be greater than zero".to_string(),
+        ));
+    }
+    if payload.estimated_fee_usd < 0.0 {
+        return Err(AppError::BadRequest(
+            "Estimated fee cannot be negative".to_string(),
+        ));
+    }
+
     let route_input = RouteExecutionInput {
-        user_id,
-        source_chain: source_chain.to_string(),
-        dest_chain: dest_chain.to_string(),
-        source_asset,
-        dest_asset,
-        amount_in: amount_in as i64,
-        amount_out: amount_out as i64,
-        provider,
-        path,
-        estimated_fee_usd,
+        user_id: payload.user_id,
+        source_chain: payload.source_chain,
+        dest_chain: payload.dest_chain,
+        source_asset: payload.source_asset,
+        dest_asset: payload.dest_asset,
+        amount_in: payload.amount_in as i64,
+        amount_out: payload.amount_out as i64,
+        provider: payload.provider,
+        path: payload.path,
+        estimated_fee_usd: payload.estimated_fee_usd,
     };
 
     let result = RouteExecutionService::execute_route_with_quota(
         &db,
         route_input,
-        anchor_domain.as_deref(),
-        anchor_transaction_id.as_deref(),
+        payload.anchor_domain.as_deref(),
+        payload.anchor_transaction_id.as_deref(),
     )
     .await
-    .map_err(map_route_execution_error)?;
+    .map_err(|e| AppError::BadRequest(format!("Route execution failed: {}", e)))?;
 
     Ok(Json(result))
 }
 
-/// Evicts a cached [`crate::bridge::gas_oracle::GasOracle`] entry on this node
-/// and best-effort broadcasts the same invalidation to every other node in
-/// the cluster over Redis (see [`crate::cache_sync`]).
-#[tracing::instrument(skip(cache), err)]
-async fn admin_invalidate_cache_handler(
-    Extension(cache): Extension<ClusterCache>,
-    Json(payload): Json<InvalidateCacheRequest>,
-) -> Result<Json<InvalidateCacheResponse>, AppError> {
-    let (message, invalidated) = match payload.chain {
-        Some(chain) => (InvalidationMessage::InvalidateChain { chain }, "chain"),
-        None => (InvalidationMessage::InvalidateAll, "all"),
-    };
-    let broadcast = cache.broadcaster.is_some();
-
-    cache.invalidate(message).await;
-
-    Ok(Json(InvalidateCacheResponse {
-        invalidated,
-        broadcast,
-    }))
-}
-
-/// Classifies an error from [`RouteExecutionService::execute_route_with_quota`]
-/// into the correct HTTP-facing [`AppError`].
-pub(crate) fn map_route_execution_error(err: Box<dyn std::error::Error>) -> AppError {
-    if let Some(sqlx_err) = err.downcast_ref::<sqlx::Error>() {
-        if matches!(
-            sqlx_err,
-            sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed
-        ) {
-            return AppError::ServiceUnavailable(
-                "Database connection pool exhausted; please retry shortly".to_string(),
-            );
-        }
-    }
-    AppError::BadRequest(format!("Route execution failed: {}", err))
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::api::validation::{validate_asset_code, validate_stellar_address};
+    use super::*;
 
     #[test]
     fn test_validate_stellar_address() {
+        // Valid address (only A-Z and 2-7, length 56, starts with G)
         assert!(validate_stellar_address(
             "GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK"
         )
         .is_ok());
 
+        // Invalid starting char
         assert!(validate_stellar_address(
             "SA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK"
         )
         .is_err());
 
+        // Invalid length
         assert!(validate_stellar_address("GA5Z3IX5").is_err());
 
+        // Invalid characters (e.g. contains 0, 1, 8, 9)
         assert!(validate_stellar_address(
             "GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JA0K"
         )
@@ -469,10 +321,12 @@ mod tests {
 
     #[test]
     fn test_validate_asset_code() {
+        // Alphanumeric standard
         assert!(validate_asset_code("USDC").is_ok());
         assert!(validate_asset_code("XLM").is_ok());
         assert!(validate_asset_code("EURT").is_ok());
 
+        // Fully qualified
         assert!(validate_asset_code(
             "stellar:USDC:GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK"
         )
@@ -486,10 +340,12 @@ mod tests {
         )
         .is_err());
 
+        // ISO-4217 format
         assert!(validate_asset_code("iso4217:USD").is_ok());
         assert!(validate_asset_code("iso4217:NGN").is_ok());
         assert!(validate_asset_code("iso4217:US").is_err());
 
+        // Empty & too long
         assert!(validate_asset_code("").is_err());
         assert!(validate_asset_code("VERYLONGASSETCODE").is_err());
     }

@@ -1,12 +1,9 @@
 pub mod dex;
-pub mod slippage;
 
 use crate::bridge::{
     cctp::CctpClient, debridge::DeBridgeClient, gas_oracle::GasOracle, BridgeProvider, Chain,
 };
-use crate::config::AppConfig;
 use crate::router::dex::DexProvider;
-use crate::router::slippage::SlippageError;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -20,16 +17,6 @@ pub struct RouteOption {
     pub amount_out: u64,
     pub estimated_fee_usd: f64,
     pub duration_seconds: u64,
-    /// Total constant-product price impact across the legs of this route,
-    /// in basis points.
-    pub price_impact_bps: u32,
-    /// Dynamic slippage tolerance for this route, derived from pool depth
-    /// and trade size rather than a static default. Surfaced so the
-    /// frontend can warn the user before execution.
-    pub slippage_bps: u32,
-    /// True if any leg of this route was large enough to be automatically
-    /// split into multiple tranches to reduce its blended price impact.
-    pub is_split_route: bool,
     pub execution_payload: Option<String>,
 }
 
@@ -82,27 +69,16 @@ fn get_usd_value(asset: &str, amount: u64) -> f64 {
 
 impl Default for RoutePlanner {
     fn default() -> Self {
-        Self::new(Arc::new(AppConfig::default()))
+        Self::new()
     }
 }
 
 impl RoutePlanner {
-    pub fn new(config: Arc<AppConfig>) -> Self {
-        let oracle = Arc::new(GasOracle::new(config.clone()));
-        Self::with_gas_oracle(oracle, config)
-    }
-
-    /// Builds a planner backed by a caller-supplied, shared [`GasOracle`].
-    ///
-    /// Production call sites (see [`crate::api`]) hold a single long-lived
-    /// `Arc<GasOracle>` for the life of the process instead of the
-    /// per-request oracle [`RoutePlanner::new`] creates, so that its cache is
-    /// actually shared across requests — and therefore a meaningful target
-    /// for [`crate::cache_sync`]'s cluster-wide invalidation.
-    pub fn with_gas_oracle(oracle: Arc<GasOracle>, config: Arc<AppConfig>) -> Self {
+    pub fn new() -> Self {
+        let oracle = Arc::new(GasOracle::new());
         Self {
             debridge: DeBridgeClient::new(oracle.clone()),
-            cctp: CctpClient::new(oracle, config),
+            cctp: CctpClient::new(oracle),
         }
     }
 
@@ -114,6 +90,7 @@ impl RoutePlanner {
         source_asset: &str,
         dest_asset: &str,
         amount_in: u64,
+        multi_path: bool,
     ) -> Result<Vec<RouteOption>, anyhow::Error> {
         let start_node = Node {
             chain: source_chain,
@@ -139,9 +116,6 @@ impl RoutePlanner {
         best_seen.insert(start_node.clone(), (initial_usd * 1000.0) as u64);
 
         let mut final_routes = Vec::new();
-        // First catastrophic price-impact rejection seen while exploring,
-        // surfaced if the search ends with no viable route at all.
-        let mut impact_rejection: Option<SlippageError> = None;
         let all_chains = vec![
             Chain::Ethereum,
             Chain::Arbitrum,
@@ -168,12 +142,6 @@ impl RoutePlanner {
                     let total_fee = state.route_so_far.iter().map(|r| r.estimated_fee_usd).sum();
                     let total_duration =
                         state.route_so_far.iter().map(|r| r.duration_seconds).sum();
-                    // Impacts on successive legs compound; summing is an
-                    // accurate upper-bound approximation for impacts below
-                    // the 15% rejection ceiling.
-                    let total_impact = state.route_so_far.iter().map(|r| r.price_impact_bps).sum();
-                    let total_slippage = state.route_so_far.iter().map(|r| r.slippage_bps).sum();
-                    let any_split = state.route_so_far.iter().any(|r| r.is_split_route);
 
                     final_routes.push(RouteOption {
                         provider: combined_provider,
@@ -182,9 +150,6 @@ impl RoutePlanner {
                         amount_out: state.amount,
                         estimated_fee_usd: total_fee,
                         duration_seconds: total_duration,
-                        price_impact_bps: total_impact,
-                        slippage_bps: total_slippage,
-                        is_split_route: any_split,
                         execution_payload: None,
                     });
                 }
@@ -199,57 +164,40 @@ impl RoutePlanner {
             // 1. DEX Swaps (same chain)
             for target_asset in &all_assets {
                 if target_asset != &state.node.asset {
-                    match DexProvider::get_swap_quote(
+                    if let Ok(quote) = DexProvider::get_swap_quote(
                         state.node.chain,
                         &state.node.asset,
                         target_asset,
                         state.amount,
                     ) {
-                        Ok(quote) => {
-                            let next_node = Node {
-                                chain: state.node.chain,
-                                asset: target_asset.to_string(),
-                            };
-                            let next_usd = get_usd_value(target_asset, quote.amount_out);
-                            let next_usd_scaled = (next_usd * 1000.0) as u64;
+                        let next_node = Node {
+                            chain: state.node.chain,
+                            asset: target_asset.to_string(),
+                        };
+                        let next_usd = get_usd_value(target_asset, quote.amount_out);
+                        let next_usd_scaled = (next_usd * 1000.0) as u64;
 
-                            let best = best_seen.entry(next_node.clone()).or_insert(0);
+                        let best = best_seen.entry(next_node.clone()).or_insert(0);
+                        if multi_path || next_usd_scaled > *best {
                             if next_usd_scaled > *best {
                                 *best = next_usd_scaled;
-                                let mut new_route = state.route_so_far.clone();
-                                new_route.push(RouteOption {
-                                    provider: quote.provider,
-                                    path: format!("Swap {} to {}", state.node.asset, target_asset),
-                                    amount_in: state.amount,
-                                    amount_out: quote.amount_out,
-                                    estimated_fee_usd: quote.estimated_fee_usd,
-                                    duration_seconds: quote.duration_seconds,
-                                    price_impact_bps: quote.price_impact_bps,
-                                    slippage_bps: quote.slippage_bps,
-                                    is_split_route: quote.is_split,
-                                    execution_payload: None,
-                                });
-                                pq.push(State {
-                                    usd_value: next_usd_scaled,
-                                    amount: quote.amount_out,
-                                    node: next_node,
-                                    route_so_far: new_route,
-                                });
                             }
-                        }
-                        Err(err) => {
-                            // Remember catastrophic-impact rejections so an
-                            // unroutable trade surfaces a clear error rather
-                            // than silently returning no routes.
-                            if let Some(slippage_err) = err.downcast_ref::<SlippageError>() {
-                                if matches!(
-                                    slippage_err,
-                                    SlippageError::ExcessivePriceImpact { .. }
-                                ) && impact_rejection.is_none()
-                                {
-                                    impact_rejection = Some(slippage_err.clone());
-                                }
-                            }
+                            let mut new_route = state.route_so_far.clone();
+                            new_route.push(RouteOption {
+                                provider: quote.provider,
+                                path: format!("Swap {} to {}", state.node.asset, target_asset),
+                                amount_in: state.amount,
+                                amount_out: quote.amount_out,
+                                estimated_fee_usd: quote.estimated_fee_usd,
+                                duration_seconds: quote.duration_seconds,
+                                execution_payload: None,
+                            });
+                            pq.push(State {
+                                usd_value: next_usd_scaled,
+                                amount: quote.amount_out,
+                                node: next_node,
+                                route_so_far: new_route,
+                            });
                         }
                     }
                 }
@@ -284,8 +232,10 @@ impl RoutePlanner {
                             };
 
                             let best = best_seen.entry(next_node.clone()).or_insert(0);
-                            if next_usd_scaled > *best {
-                                *best = next_usd_scaled;
+                            if multi_path || next_usd_scaled > *best {
+                                if next_usd_scaled > *best {
+                                    *best = next_usd_scaled;
+                                }
                                 let mut new_route = state.route_so_far.clone();
                                 new_route.push(RouteOption {
                                     provider: quote.provider.clone(),
@@ -294,11 +244,6 @@ impl RoutePlanner {
                                     amount_out: quote.amount_out,
                                     estimated_fee_usd: quote.estimated_fee_usd,
                                     duration_seconds: quote.duration_seconds,
-                                    // Burn-and-mint bridging does not trade
-                                    // against a pool, so no price impact.
-                                    price_impact_bps: 0,
-                                    slippage_bps: 0,
-                                    is_split_route: false,
                                     execution_payload: quote.execution_payload,
                                 });
                                 pq.push(State {
@@ -336,8 +281,10 @@ impl RoutePlanner {
                         };
 
                         let best = best_seen.entry(next_node.clone()).or_insert(0);
-                        if next_usd_scaled > *best {
-                            *best = next_usd_scaled;
+                        if multi_path || next_usd_scaled > *best {
+                            if next_usd_scaled > *best {
+                                *best = next_usd_scaled;
+                            }
                             let mut new_route = state.route_so_far.clone();
                             new_route.push(RouteOption {
                                 provider: quote.provider.clone(),
@@ -346,9 +293,6 @@ impl RoutePlanner {
                                 amount_out: quote.amount_out,
                                 estimated_fee_usd: quote.estimated_fee_usd,
                                 duration_seconds: quote.duration_seconds,
-                                price_impact_bps: 0,
-                                slippage_bps: 0,
-                                is_split_route: false,
                                 execution_payload: quote.execution_payload,
                             });
                             pq.push(State {
@@ -360,15 +304,6 @@ impl RoutePlanner {
                         }
                     }
                 }
-            }
-        }
-
-        // If nothing was routable and at least one candidate leg was thrown
-        // out for catastrophic price impact, fail loudly with that reason
-        // instead of returning an empty route list.
-        if final_routes.is_empty() {
-            if let Some(rejection) = impact_rejection {
-                return Err(anyhow::Error::new(rejection));
             }
         }
 
@@ -392,9 +327,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_best_route_usdc() {
-        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
+        let planner = RoutePlanner::new();
         let routes = planner
-            .find_best_route(Chain::Solana, Chain::Stellar, "USDC", "USDC", 10000)
+            .find_best_route(Chain::Solana, Chain::Stellar, "USDC", "USDC", 10000, false)
             .await
             .unwrap();
 
@@ -409,26 +344,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_large_same_chain_swap_is_routed_as_a_split() {
-        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
-        // 1000 ETH into Ethereum's $50M-deep ETH/USDC pool has a lump price
-        // impact just over the 500 bps split threshold but nowhere near the
-        // 1500 bps catastrophic ceiling, so it should route as a split.
-        let routes = planner
-            .find_best_route(Chain::Ethereum, Chain::Ethereum, "ETH", "USDC", 1000)
-            .await
-            .unwrap();
-
-        assert!(!routes.is_empty());
-        assert!(
-            routes.iter().any(|r| r.is_split_route),
-            "a large single-chain swap should be routed with order splitting"
-        );
-    }
-
-    #[tokio::test]
     async fn test_find_best_route_multi_hop_eth_to_xlm() {
-        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
+        let planner = RoutePlanner::new();
         let routes = planner
             .find_best_route(
                 Chain::Ethereum,
@@ -436,6 +353,7 @@ mod tests {
                 "ETH",
                 "XLM",
                 1, // 1 ETH
+                false,
             )
             .await
             .unwrap();
@@ -445,38 +363,5 @@ mod tests {
             "Should find a multi-hop route for ETH -> XLM"
         );
         println!("Best multi-hop route: {:?}", routes[0]);
-    }
-
-    #[tokio::test]
-    async fn test_route_exposes_dynamic_slippage() {
-        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
-        let routes = planner
-            .find_best_route(Chain::Ethereum, Chain::Ethereum, "ETH", "USDC", 10)
-            .await
-            .unwrap();
-
-        assert!(!routes.is_empty());
-        let route = &routes[0];
-        // A swap leg is involved, so the route must carry a non-zero dynamic
-        // tolerance that includes at least the volatility buffer.
-        assert!(route.slippage_bps >= slippage::VOLATILITY_BUFFER_BPS);
-        assert!(route.slippage_bps > route.price_impact_bps);
-    }
-
-    #[tokio::test]
-    async fn test_catastrophic_trade_is_rejected_with_clear_error() {
-        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
-        // 60,000 ETH (~$180M) dwarfs every pool in the graph; all swap legs
-        // are rejected for catastrophic price impact and no route exists.
-        let err = planner
-            .find_best_route(Chain::Ethereum, Chain::Ethereum, "ETH", "USDC", 60_000)
-            .await
-            .unwrap_err();
-
-        assert!(
-            err.downcast_ref::<SlippageError>().is_some(),
-            "expected a typed slippage rejection, got: {err:?}"
-        );
-        assert!(err.to_string().contains("exceeds the maximum"));
     }
 }
