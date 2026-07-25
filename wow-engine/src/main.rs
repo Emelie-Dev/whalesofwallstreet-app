@@ -83,15 +83,68 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 3. Initialize API router with CORS enabled for seamless frontend calls.
+    // 3. Build the shared, cluster-aware cache. A single long-lived
+    //    `GasOracle` is shared across every request on this node (instead of
+    //    each request building its own throwaway one), and — if REDIS_URL is
+    //    set — a broadcaster that publishes invalidation events to every
+    //    other node. Redis is an optimization, never a hard dependency: a
+    //    missing or unreachable Redis just means this node runs on local
+    //    TTLs alone, exactly as if REDIS_URL had never been set.
+    let gas_oracle = std::sync::Arc::new(wow_engine::bridge::gas_oracle::GasOracle::new());
+    let redis_broadcaster = match &config.redis_url {
+        Some(url) => match redis::Client::open(url.as_str()) {
+            Ok(client) => match client.get_connection_manager().await {
+                Ok(manager) => {
+                    tracing::info!("Connected to Redis for cluster-wide cache invalidation");
+                    Some(std::sync::Arc::new(
+                        wow_engine::cache_sync::CacheInvalidationBroadcaster::new(
+                            Some(manager),
+                            wow_engine::cache_sync::CACHE_INVALIDATION_CHANNEL,
+                        ),
+                    ))
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to connect to Redis ({err}); running with local TTL-only caching"
+                    );
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::warn!("Invalid REDIS_URL ({err}); running with local TTL-only caching");
+                None
+            }
+        },
+        None => {
+            tracing::info!(
+                "REDIS_URL not set; running with local TTL-only caching (single-node behavior)"
+            );
+            None
+        }
+    };
+    let cluster_cache = wow_engine::cache_sync::ClusterCache {
+        gas_oracle: gas_oracle.clone(),
+        broadcaster: redis_broadcaster,
+    };
+
+    // Background task: keeps this node's cache in sync with cluster-wide
+    // invalidation events. Reconnects with backoff on its own if Redis is
+    // unreachable or drops mid-stream; never crashes the process.
+    tokio::spawn(wow_engine::cache_sync::run_redis_subscriber(
+        config.redis_url.clone(),
+        gas_oracle,
+    ));
+
+    // 4. Initialize API router with CORS enabled for seamless frontend calls.
     //    A per-request timeout (configurable via REQUEST_TIMEOUT_SECS) guards
     //    against any single request hanging on a stalled downstream dependency.
     let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
-    let app = wow_engine::api::create_router_with_timeout(db, verifier, request_timeout)
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+    let app =
+        wow_engine::api::create_router_with_cache(db, verifier, request_timeout, cluster_cache)
+            .layer(CorsLayer::permissive())
+            .layer(TraceLayer::new_for_http());
 
-    // 4. Bind TCP listener on configured port
+    // 5. Bind TCP listener on configured port
     let port = config.port;
     // Bind all container interfaces so the published Docker port can reach the
     // service. The container still runs as the unprivileged `nonroot` user.
@@ -101,14 +154,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Wow Engine is booting up and routing pipeline conversions...");
     tracing::info!("   Listening on: http://{}", addr);
     tracing::info!("   Endpoints available:");
-    tracing::info!("     - GET  /api/v1/health          (Health Check)");
-    tracing::info!("     - POST /api/v1/quote           (Quoting Pathfinder)");
-    tracing::info!("     - POST /api/v1/execute-route   (Atomic Route Execution)");
-    tracing::info!("     - POST /api/v1/anchor/deposit  (SEP-24 Deposit Anchor / On-ramp)");
-    tracing::info!("     - POST /api/v1/anchor/withdraw (SEP-24 Withdraw Anchor / Off-ramp)");
-    tracing::info!("     - POST /api/v1/anchor/quote    (SEP-38 Anchor Quotes)");
+    tracing::info!("     - GET  /api/v1/health              (Health Check)");
+    tracing::info!("     - POST /api/v1/quote               (Quoting Pathfinder)");
+    tracing::info!("     - POST /api/v1/execute-route       (Atomic Route Execution)");
+    tracing::info!("     - POST /api/v1/anchor/deposit      (SEP-24 Deposit Anchor / On-ramp)");
+    tracing::info!("     - POST /api/v1/anchor/withdraw     (SEP-24 Withdraw Anchor / Off-ramp)");
+    tracing::info!("     - POST /api/v1/anchor/quote        (SEP-38 Anchor Quotes)");
+    tracing::info!("     - POST /api/v1/admin/invalidate-cache (Cluster Cache Invalidation)");
 
-    // 5. Serve incoming TCP requests through Axum pipeline
+    // 6. Serve incoming TCP requests through Axum pipeline
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

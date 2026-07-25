@@ -22,6 +22,16 @@ pub struct AppConfig {
     /// layer; this guarantees a request can never outlive it.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// Connection string for the Redis instance used to broadcast cache
+    /// invalidations across nodes (e.g. `redis://localhost:6379`).
+    ///
+    /// When unset, the engine runs in single-node mode: it never publishes or
+    /// subscribes to invalidation messages and relies purely on local cache
+    /// TTLs. This is also the fallback behavior if Redis is configured but
+    /// becomes unreachable at runtime — a missing/broken Redis must never
+    /// crash the engine.
+    #[serde(default)]
+    pub redis_url: Option<String>,
 }
 
 fn default_port() -> u16 {

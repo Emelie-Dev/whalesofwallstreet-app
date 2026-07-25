@@ -45,6 +45,21 @@ impl GasOracle {
         }
     }
 
+    /// Evicts the cached gas fee for a single chain.
+    ///
+    /// Used both by local logic and by [`crate::cache_sync`] when a
+    /// cluster-wide invalidation message arrives for this chain, so that the
+    /// next call to [`estimate_gas_fee_usd`](Self::estimate_gas_fee_usd)
+    /// re-fetches instead of serving a stale value for the rest of the TTL.
+    pub async fn invalidate(&self, chain: Chain) {
+        self.cache.invalidate(&chain).await;
+    }
+
+    /// Evicts every cached gas fee, regardless of chain.
+    pub async fn invalidate_all(&self) {
+        self.cache.invalidate_all();
+    }
+
     async fn fetch_from_api(&self, chain: Chain) -> Result<f64, std::sync::Arc<anyhow::Error>> {
         info!(
             "Fetching real-time gas fee from external REST API for {:?}",
@@ -109,5 +124,47 @@ impl GasOracle {
 impl Default for GasOracle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Test-only direct cache accessors, used by [`crate::cache_sync`]'s tests to
+/// seed/observe cache state without going through a real (network-bound) fetch.
+#[cfg(test)]
+impl GasOracle {
+    pub(crate) async fn cache_insert_for_test(&self, chain: Chain, fee: f64) {
+        self.cache.insert(chain, fee).await;
+    }
+
+    pub(crate) async fn cached_value_for_test(&self, chain: Chain) -> Option<f64> {
+        self.cache.get(&chain).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalidate_evicts_only_the_targeted_chain() {
+        let oracle = GasOracle::new();
+        oracle.cache.insert(Chain::Ethereum, 42.0).await;
+        oracle.cache.insert(Chain::Solana, 1.0).await;
+
+        oracle.invalidate(Chain::Ethereum).await;
+
+        assert_eq!(oracle.cache.get(&Chain::Ethereum).await, None);
+        assert_eq!(oracle.cache.get(&Chain::Solana).await, Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn invalidate_all_evicts_every_chain() {
+        let oracle = GasOracle::new();
+        oracle.cache.insert(Chain::Ethereum, 42.0).await;
+        oracle.cache.insert(Chain::Solana, 1.0).await;
+
+        oracle.invalidate_all().await;
+
+        assert_eq!(oracle.cache.get(&Chain::Ethereum).await, None);
+        assert_eq!(oracle.cache.get(&Chain::Solana).await, None);
     }
 }

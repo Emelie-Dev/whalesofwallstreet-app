@@ -1,6 +1,7 @@
 pub mod anchor;
 pub mod api;
 pub mod bridge;
+pub mod cache_sync;
 pub mod config;
 pub mod db;
 pub mod error;
