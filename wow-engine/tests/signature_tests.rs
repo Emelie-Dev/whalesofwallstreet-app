@@ -164,6 +164,46 @@ async fn wrong_key_signature_is_rejected() {
 }
 
 #[tokio::test]
+async fn admin_invalidate_cache_endpoint_requires_signature() {
+    // Not on the PUBLIC_PATHS allowlist, so — like every other sensitive
+    // endpoint — it must be protected by default with no extra opt-in.
+    let (_signing_key, server) = server_with_verification();
+
+    let response = server
+        .post("/api/v1/admin/invalidate-cache")
+        .json(&json!({}))
+        .await;
+
+    response.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_invalidate_cache_endpoint_accepts_valid_signature() {
+    let (signing_key, server) = server_with_verification();
+    let payload = json!({ "chain": "Ethereum" });
+    let body = serde_json::to_vec(&payload).unwrap();
+    let ts = chrono::Utc::now().timestamp();
+    let (sn, sv, tn, tv) = sign(
+        &signing_key,
+        "POST",
+        "/api/v1/admin/invalidate-cache",
+        ts,
+        &body,
+    );
+
+    let response = server
+        .post("/api/v1/admin/invalidate-cache")
+        .json(&payload)
+        .add_header(sn, sv)
+        .add_header(tn, tv)
+        .await;
+
+    response.assert_status_ok();
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["invalidated"], "chain");
+}
+
+#[tokio::test]
 async fn public_endpoints_bypass_verification() {
     let (_signing_key, server) = server_with_verification();
 

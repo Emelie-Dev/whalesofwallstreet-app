@@ -37,6 +37,49 @@ async fn test_quote_endpoint_bad_request() {
 }
 
 #[tokio::test]
+async fn test_verify_attestation_endpoint_rejects_invalid_hex() {
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    let payload = json!({
+        "dest_chain": "Arbitrum",
+        "message": "not-hex",
+        "attestation": "0xdeadbeef"
+    });
+
+    let response = server
+        .post("/api/v1/cctp/verify-attestation")
+        .json(&payload)
+        .await;
+    response.assert_status_bad_request();
+    assert!(response.text().contains("Invalid hex in message"));
+}
+
+#[tokio::test]
+async fn test_verify_attestation_endpoint_rejects_malformed_attestation() {
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    // Structurally invalid: 64 bytes is not a whole number of 65-byte
+    // signatures. Rejected synchronously, before any key fetch.
+    let payload = json!({
+        "dest_chain": "Arbitrum",
+        "message": "0x00",
+        "attestation": format!("0x{}", "ab".repeat(64))
+    });
+
+    let response = server
+        .post("/api/v1/cctp/verify-attestation")
+        .json(&payload)
+        .await;
+    response.assert_status_bad_request();
+
+    let err_msg = response.text();
+    assert!(err_msg.contains("Attestation rejected"));
+    assert!(err_msg.contains("malformed attestation"));
+}
+
+#[tokio::test]
 async fn test_quote_endpoint_exposes_dynamic_slippage() {
     let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
@@ -103,6 +146,54 @@ async fn test_deposit_endpoint_invalid_address() {
 
     let err_msg = response.text();
     assert!(err_msg.contains("Invalid account address"));
+}
+
+#[tokio::test]
+async fn test_admin_invalidate_cache_endpoint_invalidates_specific_chain() {
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    let response = server
+        .post("/api/v1/admin/invalidate-cache")
+        .json(&json!({ "chain": "Ethereum" }))
+        .await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["invalidated"], "chain");
+    // No REDIS_URL configured in this router, so the broadcast must be
+    // reported as skipped rather than silently pretending to succeed.
+    assert_eq!(body["broadcast"], false);
+}
+
+#[tokio::test]
+async fn test_admin_invalidate_cache_endpoint_invalidates_all_when_chain_omitted() {
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    let response = server
+        .post("/api/v1/admin/invalidate-cache")
+        .json(&json!({}))
+        .await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["invalidated"], "all");
+    assert_eq!(body["broadcast"], false);
+}
+
+#[tokio::test]
+async fn test_admin_invalidate_cache_endpoint_rejects_unknown_chain() {
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    let response = server
+        .post("/api/v1/admin/invalidate-cache")
+        .json(&json!({ "chain": "Bitcoin" }))
+        .await;
+    // Axum's `Json` extractor rejects an undeserializable body before the
+    // handler ever runs, surfacing as 422 (not our handler's own 400s).
+    response.assert_status(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
