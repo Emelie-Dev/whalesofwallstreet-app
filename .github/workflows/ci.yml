@@ -2,13 +2,13 @@ name: Wow Engine CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
-      - 'wow-engine/**'
+      - "wow-engine/**"
   pull_request:
-    branches: [ main ]
+    branches: [main]
     paths:
-      - 'wow-engine/**'
+      - "wow-engine/**"
 
 jobs:
   test:
@@ -17,25 +17,83 @@ jobs:
     defaults:
       run:
         working-directory: wow-engine
-    
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: wow_engine
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/wow_engine
+      SQLX_OFFLINE: true
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: wow-engine
-          
+
       - name: Check Formatting
         run: cargo fmt -- --check
-        
+
       - name: Clippy Lints
         run: cargo clippy -- -D warnings
-        
+
+      # Verifies that the .sqlx offline cache is up to date.
+      # If a developer modifies a sqlx::query! macro but forgets to run
+      # `cargo sqlx prepare`, this step will fail and block the PR.
+      - name: Verify SQLx offline cache is up to date
+        run: |
+          cargo install sqlx-cli --no-default-features --features postgres --locked
+          sqlx migrate run
+          cargo sqlx prepare --check
+        env:
+          SQLX_OFFLINE: false
+
       - name: Run Tests
         run: cargo test
+
+  chaos:
+    name: Chaos Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wow-engine
+
+    # The chaos suite is deliberately self-contained: every outage it simulates
+    # is a Tokio timer driven under a paused clock, so it needs no Postgres and
+    # no network. Running it as its own DB-free job keeps it fast and guarantees
+    # a failure here points at a resilience regression, not flaky infrastructure.
+    env:
+      SQLX_OFFLINE: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wow-engine
+
+      - name: Run chaos suite
+        run: cargo test --test chaos_tests
