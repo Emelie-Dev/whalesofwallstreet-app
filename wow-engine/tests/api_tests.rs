@@ -149,6 +149,54 @@ async fn test_deposit_endpoint_invalid_address() {
 }
 
 #[tokio::test]
+async fn test_admin_invalidate_cache_endpoint_invalidates_specific_chain() {
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    let response = server
+        .post("/api/v1/admin/invalidate-cache")
+        .json(&json!({ "chain": "Ethereum" }))
+        .await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["invalidated"], "chain");
+    // No REDIS_URL configured in this router, so the broadcast must be
+    // reported as skipped rather than silently pretending to succeed.
+    assert_eq!(body["broadcast"], false);
+}
+
+#[tokio::test]
+async fn test_admin_invalidate_cache_endpoint_invalidates_all_when_chain_omitted() {
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    let response = server
+        .post("/api/v1/admin/invalidate-cache")
+        .json(&json!({}))
+        .await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["invalidated"], "all");
+    assert_eq!(body["broadcast"], false);
+}
+
+#[tokio::test]
+async fn test_admin_invalidate_cache_endpoint_rejects_unknown_chain() {
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    let response = server
+        .post("/api/v1/admin/invalidate-cache")
+        .json(&json!({ "chain": "Bitcoin" }))
+        .await;
+    // Axum's `Json` extractor rejects an undeserializable body before the
+    // handler ever runs, surfacing as 422 (not our handler's own 400s).
+    response.assert_status(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn test_anchor_quote_invalid_amount() {
     let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();

@@ -22,6 +22,16 @@ pub struct AppConfig {
     /// layer; this guarantees a request can never outlive it.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// Connection string for the Redis instance used to broadcast cache
+    /// invalidations across nodes (e.g. `redis://localhost:6379`).
+    ///
+    /// When unset, the engine runs in single-node mode: it never publishes or
+    /// subscribes to invalidation messages and relies purely on local cache
+    /// TTLs. This is also the fallback behavior if Redis is configured but
+    /// becomes unreachable at runtime — a missing/broken Redis must never
+    /// crash the engine.
+    #[serde(default)]
+    pub redis_url: Option<String>,
     /// JSON-RPC endpoint used to read Circle CCTP attester keys on-chain.
     #[serde(default = "default_eth_rpc_url")]
     pub eth_rpc_url: String,
@@ -62,6 +72,7 @@ impl Default for AppConfig {
             database_url: None,
             signing_public_key: None,
             request_timeout_secs: default_request_timeout_secs(),
+            redis_url: None,
             eth_rpc_url: default_eth_rpc_url(),
             cctp_message_transmitter: default_cctp_message_transmitter(),
             cctp_nonce_store_path: default_cctp_nonce_store_path(),

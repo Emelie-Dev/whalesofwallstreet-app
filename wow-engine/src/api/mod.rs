@@ -3,6 +3,7 @@ use crate::bridge::attestation::AttestationError;
 use crate::bridge::cctp::CctpClient;
 use crate::bridge::gas_oracle::GasOracle;
 use crate::bridge::Chain;
+use crate::cache_sync::{ClusterCache, InvalidationMessage};
 use crate::db::models::RouteExecutionInput;
 use crate::db::service::{ExecuteRouteResult, RouteExecutionService};
 use crate::db::Database;
@@ -115,6 +116,29 @@ pub struct HealthResponse {
     pub timestamp: String,
 }
 
+/// Body for `POST /api/v1/admin/invalidate-cache`.
+///
+/// Not on [`auth::PUBLIC_PATHS`], so it requires a valid request signature
+/// whenever one is configured — see the module docs on [`auth`].
+#[derive(Deserialize, Debug, Default)]
+pub struct InvalidateCacheRequest {
+    /// Evict only this chain's cached entry. Omit (or send `null`) to
+    /// invalidate every cached entry, e.g. for an emergency-pause reset.
+    #[serde(default)]
+    pub chain: Option<Chain>,
+}
+
+#[derive(Serialize)]
+pub struct InvalidateCacheResponse {
+    /// `"chain"` or `"all"`, describing what was evicted locally.
+    pub invalidated: &'static str,
+    /// Whether the invalidation was also broadcast to the rest of the
+    /// cluster over Redis. `false` when Redis isn't configured or is
+    /// currently unreachable — the local eviction above still applies either
+    /// way.
+    pub broadcast: bool,
+}
+
 /// Builds the application router.
 ///
 /// `db` injects the (optional) database used by `/execute-route`. `verifier`
@@ -134,10 +158,31 @@ pub fn create_router(db: Option<Database>, verifier: Option<SignatureVerifier>) 
 /// aborted and the client receives `408 Request Timeout` instead of hanging.
 /// This is what prevents a single stalled bridge/database call from tying up a
 /// connection forever.
+///
+/// Builds a purely local [`ClusterCache`] (no Redis connectivity) — use
+/// [`create_router_with_cache`] to wire up cluster-wide cache invalidation.
 pub fn create_router_with_timeout(
     db: Option<Database>,
     verifier: Option<SignatureVerifier>,
     request_timeout: Duration,
+) -> Router {
+    create_router_with_cache(db, verifier, request_timeout, ClusterCache::local_only())
+}
+
+/// Like [`create_router_with_timeout`], but with an explicit, caller-supplied
+/// [`ClusterCache`].
+///
+/// Production wiring (see `main`) builds one long-lived `ClusterCache` at
+/// startup — sharing a single [`crate::bridge::gas_oracle::GasOracle`] (and,
+/// when `REDIS_URL` is configured, a cluster-invalidation broadcaster) across
+/// every request — and passes it in here instead of letting each request
+/// build its own throwaway cache that a Redis invalidation message would have
+/// nothing to act on.
+pub fn create_router_with_cache(
+    db: Option<Database>,
+    verifier: Option<SignatureVerifier>,
+    request_timeout: Duration,
+    cache: ClusterCache,
 ) -> Router {
     let router = Router::new()
         .route("/api/v1/health", get(health_handler))
@@ -151,10 +196,15 @@ pub fn create_router_with_timeout(
         .route("/api/v1/anchor/withdraw", post(withdraw_handler))
         .route("/api/v1/anchor/quote", post(anchor_quote_handler))
         .route(
+            "/api/v1/admin/invalidate-cache",
+            post(admin_invalidate_cache_handler),
+        )
+        .route(
             "/api/v1/cctp/verify-attestation",
             post(verify_attestation_handler),
         )
-        .layer(Extension(db));
+        .layer(Extension(db))
+        .layer(Extension(cache));
 
     // The signature layer is added last so it runs *first* — verification
     // happens before any handler (or its body extractor) sees the request.
@@ -230,8 +280,11 @@ async fn config_handler() -> Json<ConfigResponse> {
     })
 }
 
-#[tracing::instrument(err)]
-async fn quote_handler(Json(payload): Json<QuoteRequest>) -> Result<Json<QuoteResponse>, AppError> {
+#[tracing::instrument(skip(cache), err)]
+async fn quote_handler(
+    Extension(cache): Extension<ClusterCache>,
+    Json(payload): Json<QuoteRequest>,
+) -> Result<Json<QuoteResponse>, AppError> {
     if payload.source_asset.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Source asset cannot be empty".to_string(),
@@ -248,7 +301,7 @@ async fn quote_handler(Json(payload): Json<QuoteRequest>) -> Result<Json<QuoteRe
         ));
     }
 
-    let planner = RoutePlanner::new();
+    let planner = RoutePlanner::with_gas_oracle(cache.gas_oracle.clone());
     let routes = planner
         .find_best_route(
             payload.source_chain,
@@ -414,6 +467,34 @@ async fn execute_route_handler(
     .map_err(map_route_execution_error)?;
 
     Ok(Json(result))
+}
+
+/// Evicts a cached [`crate::bridge::gas_oracle::GasOracle`] entry on this node
+/// and best-effort broadcasts the same invalidation to every other node in
+/// the cluster over Redis (see [`crate::cache_sync`]).
+///
+/// This is the operator-facing trigger for the scenarios described in the
+/// cache-sync design: an admin who knows a chain's cached pricing is stale
+/// (or is triggering an emergency pause) calls this endpoint once, and every
+/// node — not just the one that received the call — evicts its local copy
+/// immediately instead of waiting out its TTL.
+#[tracing::instrument(skip(cache), err)]
+async fn admin_invalidate_cache_handler(
+    Extension(cache): Extension<ClusterCache>,
+    Json(payload): Json<InvalidateCacheRequest>,
+) -> Result<Json<InvalidateCacheResponse>, AppError> {
+    let (message, invalidated) = match payload.chain {
+        Some(chain) => (InvalidationMessage::InvalidateChain { chain }, "chain"),
+        None => (InvalidationMessage::InvalidateAll, "all"),
+    };
+    let broadcast = cache.broadcaster.is_some();
+
+    cache.invalidate(message).await;
+
+    Ok(Json(InvalidateCacheResponse {
+        invalidated,
+        broadcast,
+    }))
 }
 
 /// Classifies an error from [`RouteExecutionService::execute_route_with_quota`]

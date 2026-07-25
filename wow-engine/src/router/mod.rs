@@ -84,7 +84,17 @@ impl Default for RoutePlanner {
 
 impl RoutePlanner {
     pub fn new() -> Self {
-        let oracle = Arc::new(GasOracle::new());
+        Self::with_gas_oracle(Arc::new(GasOracle::new()))
+    }
+
+    /// Builds a planner backed by a caller-supplied, shared [`GasOracle`].
+    ///
+    /// Production call sites (see [`crate::api`]) hold a single long-lived
+    /// `Arc<GasOracle>` for the life of the process instead of the
+    /// per-request oracle [`RoutePlanner::new`] creates, so that its cache is
+    /// actually shared across requests — and therefore a meaningful target
+    /// for [`crate::cache_sync`]'s cluster-wide invalidation.
+    pub fn with_gas_oracle(oracle: Arc<GasOracle>) -> Self {
         Self {
             debridge: DeBridgeClient::new(oracle.clone()),
             cctp: CctpClient::new(oracle),
