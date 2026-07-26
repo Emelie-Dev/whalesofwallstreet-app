@@ -353,11 +353,7 @@ async fn deposit_handler(
 
     let client = Sep24Client::new();
     let tx = client
-        .initiate_deposit(
-            &valid_domain,
-            &payload.asset_code,
-            &payload.account,
-        )
+        .initiate_deposit(&valid_domain, &payload.asset_code, &payload.account)
         .await?;
     Ok(Json(tx))
 }
@@ -382,11 +378,7 @@ async fn withdraw_handler(
 
     let client = Sep24Client::new();
     let tx = client
-        .initiate_withdrawal(
-            &valid_domain,
-            &payload.asset_code,
-            &payload.account,
-        )
+        .initiate_withdrawal(&valid_domain, &payload.asset_code, &payload.account)
         .await?;
     Ok(Json(tx))
 }

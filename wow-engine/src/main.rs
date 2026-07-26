@@ -139,10 +139,15 @@ async fn main() -> anyhow::Result<()> {
     //    A per-request timeout (configurable via REQUEST_TIMEOUT_SECS) guards
     //    against any single request hanging on a stalled downstream dependency.
     let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
-    let app =
-        wow_engine::api::create_router_with_cache(db, verifier, request_timeout, cluster_cache, config.clone())
-            .layer(CorsLayer::permissive())
-            .layer(TraceLayer::new_for_http());
+    let app = wow_engine::api::create_router_with_cache(
+        db,
+        verifier,
+        request_timeout,
+        cluster_cache,
+        config.clone(),
+    )
+    .layer(CorsLayer::permissive())
+    .layer(TraceLayer::new_for_http());
 
     // 5. Bind TCP listener on configured port
     let port = config.port;

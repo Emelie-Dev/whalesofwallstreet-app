@@ -35,10 +35,8 @@ pub fn validate_asset_code(asset: &str) -> Result<(), String> {
         if code.is_empty() || code.len() > 12 {
             return Err("Asset code must be between 1 and 12 characters".to_string());
         }
-        return Ok(());
-    }
-
-    if asset.starts_with("iso4217:") {
+        Ok(())
+    } else if asset.starts_with("iso4217:") {
         let parts: Vec<&str> = asset.split(':').collect();
         if parts.len() != 2 || parts[1].len() != 3 {
             return Err(
@@ -46,26 +44,23 @@ pub fn validate_asset_code(asset: &str) -> Result<(), String> {
                     .to_string(),
             );
         }
-        return Ok(());
-    }
-
-    if asset.len() > 12 {
-        return Err("Asset code must be 12 characters or fewer".to_string());
-    }
-
-    for c in asset.chars() {
-        if !c.is_ascii_alphanumeric() {
-            return Err("Asset code must be alphanumeric".to_string());
+        Ok(())
+    } else {
+        if asset.len() > 12 {
+            return Err("Asset code must be 12 characters or fewer".to_string());
         }
-    }
 
-    Ok(())
+        for c in asset.chars() {
+            if !c.is_ascii_alphanumeric() {
+                return Err("Asset code must be alphanumeric".to_string());
+            }
+        }
+
+        Ok(())
+    }
 }
 
-pub fn validate_anchor_domain(
-    domain: &str,
-    allowlist: &HashSet<String>,
-) -> Result<String, String> {
+pub fn validate_anchor_domain(domain: &str, allowlist: &HashSet<String>) -> Result<String, String> {
     if domain.is_empty() {
         return Err("Anchor domain cannot be empty".to_string());
     }

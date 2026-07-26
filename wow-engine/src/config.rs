@@ -70,10 +70,15 @@ fn default_cctp_nonce_store_path() -> String {
 }
 
 fn default_allowed_anchor_domains() -> HashSet<String> {
-    ["testanchor.stellar.org", "lobstr.co", "anchor.mykuma.io", "test.com"]
-        .into_iter()
-        .map(String::from)
-        .collect()
+    [
+        "testanchor.stellar.org",
+        "lobstr.co",
+        "anchor.mykuma.io",
+        "test.com",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 impl Default for AppConfig {

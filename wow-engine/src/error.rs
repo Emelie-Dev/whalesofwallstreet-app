@@ -35,7 +35,7 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, err_msg) = match self {
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::Unauthorized(msg) => {
                 // Log at debug: signature failures are expected noise from
                 // probes/misconfigured callers and should not spam error logs.
@@ -44,7 +44,7 @@ impl IntoResponse for AppError {
             }
             AppError::ServiceUnavailable(msg) => {
                 tracing::warn!("Service unavailable: {msg}");
-                (StatusCode::SERVICE_UNAVAILABLE, msg.clone())
+                (StatusCode::SERVICE_UNAVAILABLE, msg)
             }
             AppError::Internal(err) => {
                 tracing::error!("Internal error: {:?}", err);
