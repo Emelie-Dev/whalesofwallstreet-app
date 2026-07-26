@@ -4,6 +4,7 @@ use crate::bridge::cctp::CctpClient;
 use crate::bridge::gas_oracle::GasOracle;
 use crate::bridge::Chain;
 use crate::cache_sync::{ClusterCache, InvalidationMessage};
+use crate::config::AppConfig;
 use crate::db::models::RouteExecutionInput;
 use crate::db::service::{ExecuteRouteResult, RouteExecutionService};
 use crate::db::Database;
@@ -28,7 +29,7 @@ pub mod auth;
 pub mod middleware;
 pub mod validation;
 use auth::SignatureVerifier;
-use validation::{validate_asset_code, validate_stellar_address};
+use validation::{validate_anchor_domain, validate_asset_code, validate_stellar_address};
 
 #[derive(Serialize)]
 pub struct ConfigResponse {
@@ -166,7 +167,13 @@ pub fn create_router_with_timeout(
     verifier: Option<SignatureVerifier>,
     request_timeout: Duration,
 ) -> Router {
-    create_router_with_cache(db, verifier, request_timeout, ClusterCache::local_only())
+    create_router_with_cache(
+        db,
+        verifier,
+        request_timeout,
+        ClusterCache::local_only(),
+        AppConfig::default(),
+    )
 }
 
 /// Like [`create_router_with_timeout`], but with an explicit, caller-supplied
@@ -183,6 +190,7 @@ pub fn create_router_with_cache(
     verifier: Option<SignatureVerifier>,
     request_timeout: Duration,
     cache: ClusterCache,
+    config: AppConfig,
 ) -> Router {
     let router = Router::new()
         .route("/api/v1/health", get(health_handler))
@@ -204,7 +212,8 @@ pub fn create_router_with_cache(
             post(verify_attestation_handler),
         )
         .layer(Extension(db))
-        .layer(Extension(cache));
+        .layer(Extension(cache))
+        .layer(Extension(config));
 
     // The signature layer is added last so it runs *first* — verification
     // happens before any handler (or its body extractor) sees the request.
@@ -324,8 +333,9 @@ async fn quote_handler(
     Ok(Json(QuoteResponse { routes }))
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(skip(config), err)]
 async fn deposit_handler(
+    Extension(config): Extension<AppConfig>,
     Json(payload): Json<DepositRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -337,25 +347,20 @@ async fn deposit_handler(
     if let Err(err) = validate_asset_code(&payload.asset_code) {
         return Err(AppError::BadRequest(format!("Invalid asset code: {}", err)));
     }
-    if payload.anchor_domain.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "Anchor domain cannot be empty".to_string(),
-        ));
-    }
+    let valid_domain =
+        validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
+            .map_err(AppError::BadRequest)?;
 
     let client = Sep24Client::new();
     let tx = client
-        .initiate_deposit(
-            &payload.anchor_domain,
-            &payload.asset_code,
-            &payload.account,
-        )
+        .initiate_deposit(&valid_domain, &payload.asset_code, &payload.account)
         .await?;
     Ok(Json(tx))
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(skip(config), err)]
 async fn withdraw_handler(
+    Extension(config): Extension<AppConfig>,
     Json(payload): Json<WithdrawRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -367,25 +372,20 @@ async fn withdraw_handler(
     if let Err(err) = validate_asset_code(&payload.asset_code) {
         return Err(AppError::BadRequest(format!("Invalid asset code: {}", err)));
     }
-    if payload.anchor_domain.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "Anchor domain cannot be empty".to_string(),
-        ));
-    }
+    let valid_domain =
+        validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
+            .map_err(AppError::BadRequest)?;
 
     let client = Sep24Client::new();
     let tx = client
-        .initiate_withdrawal(
-            &payload.anchor_domain,
-            &payload.asset_code,
-            &payload.account,
-        )
+        .initiate_withdrawal(&valid_domain, &payload.asset_code, &payload.account)
         .await?;
     Ok(Json(tx))
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(skip(config), err)]
 async fn anchor_quote_handler(
+    Extension(config): Extension<AppConfig>,
     Json(payload): Json<AnchorQuoteRequest>,
 ) -> Result<Json<Sep38Quote>, AppError> {
     if let Err(err) = validate_asset_code(&payload.sell_asset) {
@@ -399,16 +399,14 @@ async fn anchor_quote_handler(
             "Sell amount must be greater than zero".to_string(),
         ));
     }
-    if payload.anchor_domain.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "Anchor domain cannot be empty".to_string(),
-        ));
-    }
+    let valid_domain =
+        validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
+            .map_err(AppError::BadRequest)?;
 
     let client = Sep38Client::new();
     let quote = client
         .get_indicative_quote(
-            &payload.anchor_domain,
+            &valid_domain,
             &payload.sell_asset,
             &payload.buy_asset,
             payload.sell_amount,

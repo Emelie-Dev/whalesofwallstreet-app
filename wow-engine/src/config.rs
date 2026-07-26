@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashSet;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct AppConfig {
@@ -42,6 +43,9 @@ pub struct AppConfig {
     /// replay protection survives restarts and redeploys.
     #[serde(default = "default_cctp_nonce_store_path")]
     pub cctp_nonce_store_path: String,
+    /// Explicit allowlist of allowed anchor domains to prevent SSRF vulnerabilities.
+    #[serde(default = "default_allowed_anchor_domains")]
+    pub allowed_anchor_domains: HashSet<String>,
 }
 
 fn default_port() -> u16 {
@@ -65,6 +69,18 @@ fn default_cctp_nonce_store_path() -> String {
     "data/cctp_consumed_nonces.log".to_string()
 }
 
+fn default_allowed_anchor_domains() -> HashSet<String> {
+    [
+        "testanchor.stellar.org",
+        "lobstr.co",
+        "anchor.mykuma.io",
+        "test.com",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -76,6 +92,7 @@ impl Default for AppConfig {
             eth_rpc_url: default_eth_rpc_url(),
             cctp_message_transmitter: default_cctp_message_transmitter(),
             cctp_nonce_store_path: default_cctp_nonce_store_path(),
+            allowed_anchor_domains: default_allowed_anchor_domains(),
         }
     }
 }
