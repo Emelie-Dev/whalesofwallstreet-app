@@ -1,17 +1,20 @@
 use crate::bridge::Chain;
+use crate::config::AppConfig;
 use moka::future::Cache;
 use reqwest::Client;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
 pub struct GasOracle {
+    config: Arc<AppConfig>,
     cache: Cache<Chain, f64>,
     client: Client,
 }
 
 impl GasOracle {
-    pub fn new() -> Self {
+    pub fn new(config: Arc<AppConfig>) -> Self {
         // Cache with 60 seconds TTL
         let cache = Cache::builder()
             .time_to_live(Duration::from_secs(60))
@@ -23,7 +26,11 @@ impl GasOracle {
             .build()
             .expect("Failed to build HTTP client for GasOracle");
 
-        Self { cache, client }
+        Self {
+            config,
+            cache,
+            client,
+        }
     }
 
     pub async fn estimate_gas_fee_usd(&self, chain: Chain) -> f64 {
@@ -46,11 +53,6 @@ impl GasOracle {
     }
 
     /// Evicts the cached gas fee for a single chain.
-    ///
-    /// Used both by local logic and by [`crate::cache_sync`] when a
-    /// cluster-wide invalidation message arrives for this chain, so that the
-    /// next call to [`estimate_gas_fee_usd`](Self::estimate_gas_fee_usd)
-    /// re-fetches instead of serving a stale value for the rest of the TTL.
     pub async fn invalidate(&self, chain: Chain) {
         self.cache.invalidate(&chain).await;
     }
@@ -77,8 +79,12 @@ impl GasOracle {
     }
 
     async fn fetch_etherscan(&self) -> Result<f64, anyhow::Error> {
-        let url = "https://api.etherscan.io/api?module=gastracker&action=gasoracle";
-        let resp: Value = self.client.get(url).send().await?.json().await?;
+        let base = "https://api.etherscan.io/api?module=gastracker&action=gasoracle";
+        let url = match &self.config.etherscan_api_key {
+            Some(key) => format!("{base}&apikey={key}"),
+            None => base.to_string(),
+        };
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
 
         // Etherscan returns "ProposeGasPrice" in Gwei
         if let Some(price_str) = resp
@@ -96,8 +102,12 @@ impl GasOracle {
     }
 
     async fn fetch_arbiscan(&self) -> Result<f64, anyhow::Error> {
-        let url = "https://api.arbiscan.io/api?module=gastracker&action=gasoracle";
-        let resp: Value = self.client.get(url).send().await?.json().await?;
+        let base = "https://api.arbiscan.io/api?module=gastracker&action=gasoracle";
+        let url = match &self.config.arbiscan_api_key {
+            Some(key) => format!("{base}&apikey={key}"),
+            None => base.to_string(),
+        };
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
 
         if let Some(price_str) = resp
             .get("result")
@@ -123,7 +133,7 @@ impl GasOracle {
 
 impl Default for GasOracle {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(AppConfig::default()))
     }
 }
 
@@ -146,7 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidate_evicts_only_the_targeted_chain() {
-        let oracle = GasOracle::new();
+        let oracle = GasOracle::new(Arc::new(AppConfig::default()));
         oracle.cache.insert(Chain::Ethereum, 42.0).await;
         oracle.cache.insert(Chain::Solana, 1.0).await;
 
@@ -158,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidate_all_evicts_every_chain() {
-        let oracle = GasOracle::new();
+        let oracle = GasOracle::new(Arc::new(AppConfig::default()));
         oracle.cache.insert(Chain::Ethereum, 42.0).await;
         oracle.cache.insert(Chain::Solana, 1.0).await;
 

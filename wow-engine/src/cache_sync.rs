@@ -22,6 +22,7 @@
 
 use crate::bridge::gas_oracle::GasOracle;
 use crate::bridge::Chain;
+use crate::config::AppConfig;
 use redis::aio::{ConnectionManager, PubSub};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -264,8 +265,13 @@ impl ClusterCache {
     /// Builds a cache with no cluster connectivity: purely local, TTL-only.
     /// Used as the default for callers (and tests) that don't need Redis.
     pub fn local_only() -> Self {
+        Self::with_config(Arc::new(AppConfig::default()))
+    }
+
+    /// Builds a local-only cache using the supplied configuration.
+    pub fn with_config(config: Arc<AppConfig>) -> Self {
         Self {
-            gas_oracle: Arc::new(GasOracle::new()),
+            gas_oracle: Arc::new(GasOracle::new(config)),
             broadcaster: None,
         }
     }
@@ -415,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscriber_loop_processes_multiple_messages_in_order() {
-        let gas_oracle = Arc::new(GasOracle::new());
+        let gas_oracle = Arc::new(GasOracle::new(Arc::new(AppConfig::default())));
         gas_oracle
             .cache_insert_for_test(Chain::Ethereum, 99.0)
             .await;
@@ -445,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_message_is_ignored_without_panicking() {
-        let gas_oracle = Arc::new(GasOracle::new());
+        let gas_oracle = Arc::new(GasOracle::new(Arc::new(AppConfig::default())));
         gas_oracle
             .cache_insert_for_test(Chain::Ethereum, 99.0)
             .await;

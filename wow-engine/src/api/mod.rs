@@ -4,6 +4,7 @@ use crate::bridge::cctp::CctpClient;
 use crate::bridge::gas_oracle::GasOracle;
 use crate::bridge::Chain;
 use crate::cache_sync::{ClusterCache, InvalidationMessage};
+use crate::config::AppConfig;
 use crate::db::models::RouteExecutionInput;
 use crate::db::service::{ExecuteRouteResult, RouteExecutionService};
 use crate::db::Database;
@@ -152,13 +153,6 @@ pub fn create_router(db: Option<Database>, verifier: Option<SignatureVerifier>) 
 
 /// Like [`create_router`], but with an explicit per-request timeout.
 ///
-/// The [`TimeoutLayer`] is the outermost application layer (added last, so it
-/// wraps everything): if any handler — or a downstream dependency it is waiting
-/// on — fails to produce a response within `request_timeout`, the request is
-/// aborted and the client receives `408 Request Timeout` instead of hanging.
-/// This is what prevents a single stalled bridge/database call from tying up a
-/// connection forever.
-///
 /// Builds a purely local [`ClusterCache`] (no Redis connectivity) — use
 /// [`create_router_with_cache`] to wire up cluster-wide cache invalidation.
 pub fn create_router_with_timeout(
@@ -166,7 +160,8 @@ pub fn create_router_with_timeout(
     verifier: Option<SignatureVerifier>,
     request_timeout: Duration,
 ) -> Router {
-    create_router_with_cache(db, verifier, request_timeout, ClusterCache::local_only())
+    let config = Arc::new(AppConfig::default());
+    create_router_with_cache(db, verifier, request_timeout, ClusterCache::local_only(), config)
 }
 
 /// Like [`create_router_with_timeout`], but with an explicit, caller-supplied
@@ -183,6 +178,7 @@ pub fn create_router_with_cache(
     verifier: Option<SignatureVerifier>,
     request_timeout: Duration,
     cache: ClusterCache,
+    config: Arc<AppConfig>,
 ) -> Router {
     let router = Router::new()
         .route("/api/v1/health", get(health_handler))
@@ -204,7 +200,8 @@ pub fn create_router_with_cache(
             post(verify_attestation_handler),
         )
         .layer(Extension(db))
-        .layer(Extension(cache));
+        .layer(Extension(cache))
+        .layer(Extension(config));
 
     // The signature layer is added last so it runs *first* — verification
     // happens before any handler (or its body extractor) sees the request.
@@ -223,9 +220,20 @@ pub fn create_router_with_cache(
 
 /// Shared CCTP client so the attester-key cache and the durable nonce store
 /// are consistent across requests instead of being rebuilt per call.
-fn cctp_client() -> &'static CctpClient {
+fn cctp_client(config: &Arc<AppConfig>) -> &'static CctpClient {
+    // Safety: This leaks a small, bounded allocation for the lifetime of the
+    // process. The alternative (tokio::sync::OnceCell per-config) would
+    // require the config to be `'static` and thread-safe at every call site.
+    // The leak is intentional and documented.
+    //
+    // NOTE: This approach only works when the config is identical across all
+    // callers (which it is — it's the same env vars). If per-request config
+    // divergence is ever needed, replace with an Extension.
     static CCTP_CLIENT: OnceLock<CctpClient> = OnceLock::new();
-    CCTP_CLIENT.get_or_init(|| CctpClient::new(Arc::new(GasOracle::new())))
+    CCTP_CLIENT.get_or_init(|| {
+        let oracle = Arc::new(GasOracle::new(config.clone()));
+        CctpClient::new(oracle, config.clone())
+    })
 }
 
 fn decode_hex_field(value: &str, field: &str) -> Result<Vec<u8>, AppError> {
@@ -238,12 +246,13 @@ fn decode_hex_field(value: &str, field: &str) -> Result<Vec<u8>, AppError> {
 /// Circle's centralized API.
 #[tracing::instrument(err)]
 async fn verify_attestation_handler(
+    Extension(config): Extension<Arc<AppConfig>>,
     Json(payload): Json<VerifyAttestationRequest>,
 ) -> Result<Json<VerifyAttestationResponse>, AppError> {
     let message = decode_hex_field(&payload.message, "message")?;
     let attestation = decode_hex_field(&payload.attestation, "attestation")?;
 
-    let parsed = cctp_client()
+    let parsed = cctp_client(&config)
         .verify_attestation(payload.dest_chain, &message, &attestation)
         .await
         .map_err(|err| match err {
@@ -280,9 +289,10 @@ async fn config_handler() -> Json<ConfigResponse> {
     })
 }
 
-#[tracing::instrument(skip(cache), err)]
+#[tracing::instrument(skip(cache, config), err)]
 async fn quote_handler(
     Extension(cache): Extension<ClusterCache>,
+    Extension(config): Extension<Arc<AppConfig>>,
     Json(payload): Json<QuoteRequest>,
 ) -> Result<Json<QuoteResponse>, AppError> {
     if payload.source_asset.trim().is_empty() {
@@ -301,7 +311,7 @@ async fn quote_handler(
         ));
     }
 
-    let planner = RoutePlanner::with_gas_oracle(cache.gas_oracle.clone());
+    let planner = RoutePlanner::with_gas_oracle(cache.gas_oracle.clone(), config);
     let routes = planner
         .find_best_route(
             payload.source_chain,
@@ -472,12 +482,6 @@ async fn execute_route_handler(
 /// Evicts a cached [`crate::bridge::gas_oracle::GasOracle`] entry on this node
 /// and best-effort broadcasts the same invalidation to every other node in
 /// the cluster over Redis (see [`crate::cache_sync`]).
-///
-/// This is the operator-facing trigger for the scenarios described in the
-/// cache-sync design: an admin who knows a chain's cached pricing is stale
-/// (or is triggering an emergency pause) calls this endpoint once, and every
-/// node — not just the one that received the call — evicts its local copy
-/// immediately instead of waiting out its TTL.
 #[tracing::instrument(skip(cache), err)]
 async fn admin_invalidate_cache_handler(
     Extension(cache): Extension<ClusterCache>,
@@ -499,13 +503,6 @@ async fn admin_invalidate_cache_handler(
 
 /// Classifies an error from [`RouteExecutionService::execute_route_with_quota`]
 /// into the correct HTTP-facing [`AppError`].
-///
-/// Connection-pool starvation (`PoolTimedOut`) and a closed pool
-/// (`PoolClosed`) are infrastructure problems, not client mistakes: under a
-/// Postgres outage or a connection storm the pool's `acquire_timeout` fires and
-/// we must surface `503 Service Unavailable` so the request fails fast and the
-/// caller retries, instead of masquerading as a `400` or blocking the client.
-/// Everything else (quota exceeded, bad references, etc.) remains a `400`.
 pub(crate) fn map_route_execution_error(err: Box<dyn std::error::Error>) -> AppError {
     if let Some(sqlx_err) = err.downcast_ref::<sqlx::Error>() {
         if matches!(
