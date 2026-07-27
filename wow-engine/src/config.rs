@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::sync::Arc;
+use std::collections::HashSet;
 
 /// Central configuration for the entire wow-engine.
 ///
@@ -70,6 +71,9 @@ pub struct AppConfig {
     /// When empty, CORS is fully permissive (local-dev mode).
     #[serde(default)]
     pub allowed_cors_origins: Vec<String>,
+    /// Explicit allowlist of allowed anchor domains to prevent SSRF vulnerabilities.
+    #[serde(default = "default_allowed_anchor_domains")]
+    pub allowed_anchor_domains: HashSet<String>,
 }
 
 fn default_port() -> u16 {
@@ -91,6 +95,18 @@ fn default_cctp_message_transmitter() -> String {
 
 fn default_cctp_nonce_store_path() -> String {
     "data/cctp_consumed_nonces.log".to_string()
+}
+
+fn default_allowed_anchor_domains() -> HashSet<String> {
+    [
+        "testanchor.stellar.org",
+        "lobstr.co",
+        "anchor.mykuma.io",
+        "test.com",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 impl Default for AppConfig {

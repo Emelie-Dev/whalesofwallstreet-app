@@ -164,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
         config.clone(),
     )
     .layer(cors_layer)
+    .layer(CorsLayer::permissive())
     .layer(TraceLayer::new_for_http());
 
     // 5. Bind TCP listener on configured port
