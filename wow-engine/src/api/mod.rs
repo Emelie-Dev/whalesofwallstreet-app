@@ -336,7 +336,7 @@ async fn quote_handler(
 #[tracing::instrument(skip(config, tracker), err)]
 async fn deposit_handler(
     Extension(config): Extension<AppConfig>,
-    Extension(tracker): Extension<Option<Arc<crate::anchor::tracker::TrackerStore>>>,
+    tracker: Extension<Option<Arc<crate::anchor::tracker::TrackerStore>>>,
     Json(payload): Json<DepositRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -352,7 +352,7 @@ async fn deposit_handler(
         validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
             .map_err(AppError::BadRequest)?;
 
-    let tracker = tracker.ok_or_else(|| {
+    let tracker = tracker.0.ok_or_else(|| {
         AppError::Internal(anyhow::anyhow!(
             "Database not configured for anchor tracker"
         ))
@@ -368,7 +368,7 @@ async fn deposit_handler(
 #[tracing::instrument(skip(config, tracker), err)]
 async fn withdraw_handler(
     Extension(config): Extension<AppConfig>,
-    Extension(tracker): Extension<Option<Arc<crate::anchor::tracker::TrackerStore>>>,
+    tracker: Extension<Option<Arc<crate::anchor::tracker::TrackerStore>>>,
     Json(payload): Json<WithdrawRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -384,7 +384,7 @@ async fn withdraw_handler(
         validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
             .map_err(AppError::BadRequest)?;
 
-    let tracker = tracker.ok_or_else(|| {
+    let tracker = tracker.0.ok_or_else(|| {
         AppError::Internal(anyhow::anyhow!(
             "Database not configured for anchor tracker"
         ))
