@@ -107,9 +107,9 @@ async fn main() -> anyhow::Result<()> {
     //    each request building its own throwaway one), and — if REDIS_URL is
     //    set — a broadcaster that publishes invalidation events to every
     //    other node.
-    let gas_oracle = std::sync::Arc::new(
-        wow_engine::bridge::gas_oracle::GasOracle::new(config.clone()),
-    );
+    let gas_oracle = std::sync::Arc::new(wow_engine::bridge::gas_oracle::GasOracle::new(
+        config.clone(),
+    ));
     let redis_broadcaster = match &config.redis_url {
         Some(url) => match redis::Client::open(url.as_str()) {
             Ok(client) => match client.get_connection_manager().await {
@@ -156,10 +156,15 @@ async fn main() -> anyhow::Result<()> {
     // 4. Initialize API router with CORS and configuration.
     let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
     let cors_layer = build_cors_layer(&config);
-    let app =
-        wow_engine::api::create_router_with_cache(db, verifier, request_timeout, cluster_cache, config.clone())
-            .layer(cors_layer)
-            .layer(TraceLayer::new_for_http());
+    let app = wow_engine::api::create_router_with_cache(
+        db,
+        verifier,
+        request_timeout,
+        cluster_cache,
+        config.clone(),
+    )
+    .layer(cors_layer)
+    .layer(TraceLayer::new_for_http());
 
     // 5. Bind TCP listener on configured port
     let port = config.port;

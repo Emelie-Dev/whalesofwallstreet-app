@@ -161,7 +161,13 @@ pub fn create_router_with_timeout(
     request_timeout: Duration,
 ) -> Router {
     let config = Arc::new(AppConfig::default());
-    create_router_with_cache(db, verifier, request_timeout, ClusterCache::local_only(), config)
+    create_router_with_cache(
+        db,
+        verifier,
+        request_timeout,
+        ClusterCache::local_only(),
+        config,
+    )
 }
 
 /// Like [`create_router_with_timeout`], but with an explicit, caller-supplied
