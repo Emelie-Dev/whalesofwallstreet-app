@@ -88,7 +88,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_debridge_client_async_drop() {
-        let oracle = Arc::new(GasOracle::new());
+        let oracle = Arc::new(GasOracle::new(
+            Arc::new(crate::config::AppConfig::default()),
+        ));
         let client = DeBridgeClient::new(oracle);
 
         // Explicitly drop to trigger the Drop implementation

@@ -4,6 +4,7 @@ pub mod slippage;
 use crate::bridge::{
     cctp::CctpClient, debridge::DeBridgeClient, gas_oracle::GasOracle, BridgeProvider, Chain,
 };
+use crate::config::AppConfig;
 use crate::router::dex::DexProvider;
 use crate::router::slippage::SlippageError;
 use serde::{Deserialize, Serialize};
@@ -78,13 +79,14 @@ fn get_usd_value(asset: &str, amount: u64) -> f64 {
 
 impl Default for RoutePlanner {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(AppConfig::default()))
     }
 }
 
 impl RoutePlanner {
-    pub fn new() -> Self {
-        Self::with_gas_oracle(Arc::new(GasOracle::new()))
+    pub fn new(config: Arc<AppConfig>) -> Self {
+        let oracle = Arc::new(GasOracle::new(config.clone()));
+        Self::with_gas_oracle(oracle, config)
     }
 
     /// Builds a planner backed by a caller-supplied, shared [`GasOracle`].
@@ -94,10 +96,10 @@ impl RoutePlanner {
     /// per-request oracle [`RoutePlanner::new`] creates, so that its cache is
     /// actually shared across requests — and therefore a meaningful target
     /// for [`crate::cache_sync`]'s cluster-wide invalidation.
-    pub fn with_gas_oracle(oracle: Arc<GasOracle>) -> Self {
+    pub fn with_gas_oracle(oracle: Arc<GasOracle>, config: Arc<AppConfig>) -> Self {
         Self {
             debridge: DeBridgeClient::new(oracle.clone()),
-            cctp: CctpClient::new(oracle),
+            cctp: CctpClient::new(oracle, config),
         }
     }
 
@@ -382,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_best_route_usdc() {
-        let planner = RoutePlanner::new();
+        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
         let routes = planner
             .find_best_route(Chain::Solana, Chain::Stellar, "USDC", "USDC", 10000)
             .await
@@ -400,7 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_best_route_multi_hop_eth_to_xlm() {
-        let planner = RoutePlanner::new();
+        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
         let routes = planner
             .find_best_route(
                 Chain::Ethereum,
@@ -421,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_route_exposes_dynamic_slippage() {
-        let planner = RoutePlanner::new();
+        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
         let routes = planner
             .find_best_route(Chain::Ethereum, Chain::Ethereum, "ETH", "USDC", 10)
             .await
@@ -437,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_catastrophic_trade_is_rejected_with_clear_error() {
-        let planner = RoutePlanner::new();
+        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
         // 60,000 ETH (~$180M) dwarfs every pool in the graph; all swap legs
         // are rejected for catastrophic price impact and no route exists.
         let err = planner

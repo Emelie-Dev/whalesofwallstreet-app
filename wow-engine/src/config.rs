@@ -1,6 +1,13 @@
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::sync::Arc;
 
+/// Central configuration for the entire wow-engine.
+///
+/// Every environment-specific value that varies between staging and production
+/// lives here, loaded once at startup from environment variables via
+/// [`envy::from_env`]. Components receive `Arc<AppConfig>` instead of reaching
+/// for their own hardcoded constants.
 #[derive(Deserialize, Debug, Clone)]
 pub struct AppConfig {
     #[serde(default = "default_port")]
@@ -16,11 +23,6 @@ pub struct AppConfig {
     pub signing_public_key: Option<String>,
     /// Upper bound, in seconds, on how long any single HTTP request may run
     /// before the server aborts it and returns `408 Request Timeout`.
-    ///
-    /// This is the outermost backstop against a hung downstream dependency
-    /// pinning a request (and its resources) open indefinitely. Individual
-    /// dependencies enforce their own, tighter timeouts via the resilience
-    /// layer; this guarantees a request can never outlive it.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
     /// Connection string for the Redis instance used to broadcast cache
@@ -28,9 +30,7 @@ pub struct AppConfig {
     ///
     /// When unset, the engine runs in single-node mode: it never publishes or
     /// subscribes to invalidation messages and relies purely on local cache
-    /// TTLs. This is also the fallback behavior if Redis is configured but
-    /// becomes unreachable at runtime — a missing/broken Redis must never
-    /// crash the engine.
+    /// TTLs.
     #[serde(default)]
     pub redis_url: Option<String>,
     /// JSON-RPC endpoint used to read Circle CCTP attester keys on-chain.
@@ -43,9 +43,39 @@ pub struct AppConfig {
     /// replay protection survives restarts and redeploys.
     #[serde(default = "default_cctp_nonce_store_path")]
     pub cctp_nonce_store_path: String,
-    /// Explicit allowlist of allowed anchor domains to prevent SSRF vulnerabilities.
+
+    // ── Gas Oracle ──────────────────────────────────────────────────
+    /// API key for Etherscan gas-tracker requests. When set, appended as
+    /// `&apikey=<key>` to the Etherscan gastracker endpoint to authenticate
+    /// outbound requests and avoid rate-limiting.
+    #[serde(default)]
+    pub etherscan_api_key: Option<String>,
+    /// API key for Arbiscan gas-tracker requests.
+    #[serde(default)]
+    pub arbiscan_api_key: Option<String>,
+
+    // ── Anchor & Frontend Allowlists ────────────────────────────────
+    /// Comma-separated list of anchor domains the engine is permitted to
+    /// interact with (e.g. `"localhost,anchor.stellar.org"`).
+    ///
+    /// Parsed from the `ALLOWED_ANCHOR_DOMAINS` env var as a comma-separated
+    /// string. When non-empty, deposit/withdraw/quote requests referencing an
+    /// anchor domain not in this list are rejected at the API layer.
+    /// Explicit allowlist of allowed anchor domains to prevent SSRF
+    /// vulnerabilities. Parsed from the `ALLOWED_ANCHOR_DOMAINS` env var as a
+    /// comma-separated string. When non-empty, deposit/withdraw/quote requests
+    /// referencing an anchor domain not in this list are rejected at the API
+    /// layer.
     #[serde(default = "default_allowed_anchor_domains")]
     pub allowed_anchor_domains: HashSet<String>,
+
+    /// Comma-separated list of allowed CORS origins (e.g.
+    /// `"https://app.example.com,http://localhost:3000"`).
+    ///
+    /// When non-empty, only requests from these origins are permitted.
+    /// When empty, CORS is fully permissive (local-dev mode).
+    #[serde(default)]
+    pub allowed_cors_origins: Vec<String>,
 }
 
 fn default_port() -> u16 {
@@ -92,7 +122,10 @@ impl Default for AppConfig {
             eth_rpc_url: default_eth_rpc_url(),
             cctp_message_transmitter: default_cctp_message_transmitter(),
             cctp_nonce_store_path: default_cctp_nonce_store_path(),
+            etherscan_api_key: None,
+            arbiscan_api_key: None,
             allowed_anchor_domains: default_allowed_anchor_domains(),
+            allowed_cors_origins: Vec::new(),
         }
     }
 }
@@ -109,5 +142,10 @@ impl AppConfig {
                  Example: postgres://postgres:postgres@localhost/wow_engine"
             )
         })
+    }
+
+    /// Wraps `self` in an `Arc` for cheap cloning across async tasks.
+    pub fn into_arc(self) -> Arc<Self> {
+        Arc::new(self)
     }
 }
