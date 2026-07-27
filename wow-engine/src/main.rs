@@ -139,6 +139,12 @@ async fn main() -> anyhow::Result<()> {
     //    A per-request timeout (configurable via REQUEST_TIMEOUT_SECS) guards
     //    against any single request hanging on a stalled downstream dependency.
     let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
+    let tracker_store = db.as_ref().map(|database| {
+        std::sync::Arc::new(wow_engine::anchor::tracker::TrackerStore::new(
+            database.clone(),
+        ))
+    });
+
     let app = wow_engine::api::create_router_with_cache(
         db,
         verifier,
@@ -146,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         cluster_cache,
         config.clone(),
     )
+    .layer(axum::Extension(tracker_store))
     .layer(CorsLayer::permissive())
     .layer(TraceLayer::new_for_http());
 

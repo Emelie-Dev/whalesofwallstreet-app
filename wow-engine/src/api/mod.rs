@@ -333,9 +333,10 @@ async fn quote_handler(
     Ok(Json(QuoteResponse { routes }))
 }
 
-#[tracing::instrument(skip(config), err)]
+#[tracing::instrument(skip(config, tracker), err)]
 async fn deposit_handler(
     Extension(config): Extension<AppConfig>,
+    Extension(tracker): Extension<Option<Arc<crate::anchor::tracker::TrackerStore>>>,
     Json(payload): Json<DepositRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -351,16 +352,23 @@ async fn deposit_handler(
         validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
             .map_err(AppError::BadRequest)?;
 
-    let client = Sep24Client::new();
+    let tracker = tracker.ok_or_else(|| {
+        AppError::Internal(anyhow::anyhow!(
+            "Database not configured for anchor tracker"
+        ))
+    })?;
+
+    let client = Sep24Client::new(tracker);
     let tx = client
         .initiate_deposit(&valid_domain, &payload.asset_code, &payload.account)
         .await?;
     Ok(Json(tx))
 }
 
-#[tracing::instrument(skip(config), err)]
+#[tracing::instrument(skip(config, tracker), err)]
 async fn withdraw_handler(
     Extension(config): Extension<AppConfig>,
+    Extension(tracker): Extension<Option<Arc<crate::anchor::tracker::TrackerStore>>>,
     Json(payload): Json<WithdrawRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -376,7 +384,13 @@ async fn withdraw_handler(
         validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
             .map_err(AppError::BadRequest)?;
 
-    let client = Sep24Client::new();
+    let tracker = tracker.ok_or_else(|| {
+        AppError::Internal(anyhow::anyhow!(
+            "Database not configured for anchor tracker"
+        ))
+    })?;
+
+    let client = Sep24Client::new(tracker);
     let tx = client
         .initiate_withdrawal(&valid_domain, &payload.asset_code, &payload.account)
         .await?;
