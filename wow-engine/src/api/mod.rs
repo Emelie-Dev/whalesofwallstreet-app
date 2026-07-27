@@ -342,7 +342,7 @@ async fn quote_handler(
 
 #[tracing::instrument(skip(config), err)]
 async fn deposit_handler(
-    Extension(config): Extension<AppConfig>,
+    Extension(config): Extension<Arc<AppConfig>>,
     Json(payload): Json<DepositRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -367,7 +367,7 @@ async fn deposit_handler(
 
 #[tracing::instrument(skip(config), err)]
 async fn withdraw_handler(
-    Extension(config): Extension<AppConfig>,
+    Extension(config): Extension<Arc<AppConfig>>,
     Json(payload): Json<WithdrawRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -392,7 +392,7 @@ async fn withdraw_handler(
 
 #[tracing::instrument(skip(config), err)]
 async fn anchor_quote_handler(
-    Extension(config): Extension<AppConfig>,
+    Extension(config): Extension<Arc<AppConfig>>,
     Json(payload): Json<AnchorQuoteRequest>,
 ) -> Result<Json<Sep38Quote>, AppError> {
     if let Err(err) = validate_asset_code(&payload.sell_asset) {

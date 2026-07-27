@@ -1,6 +1,6 @@
 use serde::Deserialize;
-use std::sync::Arc;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Central configuration for the entire wow-engine.
 ///
@@ -61,8 +61,13 @@ pub struct AppConfig {
     /// Parsed from the `ALLOWED_ANCHOR_DOMAINS` env var as a comma-separated
     /// string. When non-empty, deposit/withdraw/quote requests referencing an
     /// anchor domain not in this list are rejected at the API layer.
-    #[serde(default)]
-    pub allowed_anchor_domains: Vec<String>,
+    /// Explicit allowlist of allowed anchor domains to prevent SSRF
+    /// vulnerabilities. Parsed from the `ALLOWED_ANCHOR_DOMAINS` env var as a
+    /// comma-separated string. When non-empty, deposit/withdraw/quote requests
+    /// referencing an anchor domain not in this list are rejected at the API
+    /// layer.
+    #[serde(default = "default_allowed_anchor_domains")]
+    pub allowed_anchor_domains: HashSet<String>,
 
     /// Comma-separated list of allowed CORS origins (e.g.
     /// `"https://app.example.com,http://localhost:3000"`).
@@ -71,9 +76,6 @@ pub struct AppConfig {
     /// When empty, CORS is fully permissive (local-dev mode).
     #[serde(default)]
     pub allowed_cors_origins: Vec<String>,
-    /// Explicit allowlist of allowed anchor domains to prevent SSRF vulnerabilities.
-    #[serde(default = "default_allowed_anchor_domains")]
-    pub allowed_anchor_domains: HashSet<String>,
 }
 
 fn default_port() -> u16 {
@@ -122,7 +124,7 @@ impl Default for AppConfig {
             cctp_nonce_store_path: default_cctp_nonce_store_path(),
             etherscan_api_key: None,
             arbiscan_api_key: None,
-            allowed_anchor_domains: Vec::new(),
+            allowed_anchor_domains: default_allowed_anchor_domains(),
             allowed_cors_origins: Vec::new(),
         }
     }
