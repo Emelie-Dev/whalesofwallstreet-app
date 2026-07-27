@@ -15,15 +15,14 @@ pub struct CctpClient {
 }
 
 impl CctpClient {
-    pub fn new(oracle: Arc<GasOracle>) -> Self {
-        let config = AppConfig::load().unwrap_or_default();
+    pub fn new(oracle: Arc<GasOracle>, config: Arc<AppConfig>) -> Self {
         let client = crate::http_client::build_resilient_client()
             .expect("Failed to build resilient HTTP client");
         let key_source = RpcKeySource::new(
             crate::http_client::build_resilient_client()
                 .expect("Failed to build resilient HTTP client"),
-            config.eth_rpc_url,
-            config.cctp_message_transmitter,
+            config.eth_rpc_url.clone(),
+            config.cctp_message_transmitter.clone(),
         );
         let nonce_store = FileNonceStore::open(&config.cctp_nonce_store_path)
             .expect("Failed to open durable CCTP nonce store");

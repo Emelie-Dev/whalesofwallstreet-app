@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
-use tower_http::cors::CorsLayer;
+use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 async fn shutdown_signal() {
@@ -28,6 +29,23 @@ async fn shutdown_signal() {
     tracing::info!("Shutdown signal received, starting graceful shutdown");
 }
 
+fn build_cors_layer(config: &wow_engine::config::AppConfig) -> CorsLayer {
+    if config.allowed_cors_origins.is_empty() {
+        return CorsLayer::permissive();
+    }
+
+    let origins: Vec<_> = config
+        .allowed_cors_origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing subscriber
@@ -38,14 +56,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Load strongly-typed configuration
     let config = wow_engine::config::AppConfig::load()?;
+    let config = Arc::new(config);
+
+    tracing::info!("Configuration loaded successfully");
 
     // 1. Connect to the database (required for route execution/quota tracking)
     let db = match config.get_database_url() {
         Ok(url) => match wow_engine::db::Database::new(&url).await {
             Ok(db) => {
                 // Apply any pending schema migrations before serving traffic.
-                // This ensures the database schema always matches the binary's expectations,
-                // eliminating configuration drift across environments.
                 tracing::info!("Running pending database migrations...");
                 if let Err(err) = db.run_migrations().await {
                     tracing::error!("Fatal: failed to apply database migrations: {err}");
@@ -87,10 +106,10 @@ async fn main() -> anyhow::Result<()> {
     //    `GasOracle` is shared across every request on this node (instead of
     //    each request building its own throwaway one), and — if REDIS_URL is
     //    set — a broadcaster that publishes invalidation events to every
-    //    other node. Redis is an optimization, never a hard dependency: a
-    //    missing or unreachable Redis just means this node runs on local
-    //    TTLs alone, exactly as if REDIS_URL had never been set.
-    let gas_oracle = std::sync::Arc::new(wow_engine::bridge::gas_oracle::GasOracle::new());
+    //    other node.
+    let gas_oracle = std::sync::Arc::new(wow_engine::bridge::gas_oracle::GasOracle::new(
+        config.clone(),
+    ));
     let redis_broadcaster = match &config.redis_url {
         Some(url) => match redis::Client::open(url.as_str()) {
             Ok(client) => match client.get_connection_manager().await {
@@ -128,17 +147,15 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Background task: keeps this node's cache in sync with cluster-wide
-    // invalidation events. Reconnects with backoff on its own if Redis is
-    // unreachable or drops mid-stream; never crashes the process.
+    // invalidation events.
     tokio::spawn(wow_engine::cache_sync::run_redis_subscriber(
         config.redis_url.clone(),
         gas_oracle,
     ));
 
-    // 4. Initialize API router with CORS enabled for seamless frontend calls.
-    //    A per-request timeout (configurable via REQUEST_TIMEOUT_SECS) guards
-    //    against any single request hanging on a stalled downstream dependency.
+    // 4. Initialize API router with CORS and configuration.
     let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
+    let cors_layer = build_cors_layer(&config);
     let app = wow_engine::api::create_router_with_cache(
         db,
         verifier,
@@ -146,13 +163,12 @@ async fn main() -> anyhow::Result<()> {
         cluster_cache,
         config.clone(),
     )
+    .layer(cors_layer)
     .layer(CorsLayer::permissive())
     .layer(TraceLayer::new_for_http());
 
     // 5. Bind TCP listener on configured port
     let port = config.port;
-    // Bind all container interfaces so the published Docker port can reach the
-    // service. The container still runs as the unprivileged `nonroot` user.
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
