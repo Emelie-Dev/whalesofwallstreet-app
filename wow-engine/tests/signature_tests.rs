@@ -25,7 +25,7 @@ fn keypair() -> (SigningKey, SignatureVerifier) {
 
 fn server_with_verification() -> (SigningKey, TestServer) {
     let (signing_key, verifier) = keypair();
-    let app = create_router(None, Some(verifier));
+    let app = create_router(None, Some(verifier), None);
     (signing_key, TestServer::new(app).unwrap())
 }
 

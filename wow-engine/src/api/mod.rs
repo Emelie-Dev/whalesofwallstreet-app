@@ -1,4 +1,5 @@
 use crate::anchor::{sep24::Sep24Client, sep38::Sep38Client, Sep24InteractiveResponse, Sep38Quote};
+use crate::anchor::tracker::TrackerStore;
 use crate::bridge::attestation::AttestationError;
 use crate::bridge::cctp::CctpClient;
 use crate::bridge::gas_oracle::GasOracle;
@@ -147,8 +148,12 @@ pub struct InvalidateCacheResponse {
 /// except the public allowlist ([`auth::PUBLIC_PATHS`]) requires a valid
 /// signature; when `None`, verification is disabled entirely (intended only for
 /// local development — see `main`, which warns loudly in that case).
-pub fn create_router(db: Option<Database>, verifier: Option<SignatureVerifier>) -> Router {
-    create_router_with_timeout(db, verifier, DEFAULT_REQUEST_TIMEOUT)
+pub fn create_router(
+    db: Option<Database>,
+    verifier: Option<SignatureVerifier>,
+    tracker: Option<Arc<TrackerStore>>,
+) -> Router {
+    create_router_with_timeout(db, verifier, tracker, DEFAULT_REQUEST_TIMEOUT)
 }
 
 /// Like [`create_router`], but with an explicit per-request timeout.
@@ -158,12 +163,14 @@ pub fn create_router(db: Option<Database>, verifier: Option<SignatureVerifier>) 
 pub fn create_router_with_timeout(
     db: Option<Database>,
     verifier: Option<SignatureVerifier>,
+    tracker: Option<Arc<TrackerStore>>,
     request_timeout: Duration,
 ) -> Router {
     let config = Arc::new(AppConfig::default());
     create_router_with_cache(
         db,
         verifier,
+        tracker,
         request_timeout,
         ClusterCache::local_only(),
         config,
@@ -182,6 +189,7 @@ pub fn create_router_with_timeout(
 pub fn create_router_with_cache(
     db: Option<Database>,
     verifier: Option<SignatureVerifier>,
+    tracker: Option<Arc<TrackerStore>>,
     request_timeout: Duration,
     cache: ClusterCache,
     config: Arc<AppConfig>,
@@ -207,10 +215,9 @@ pub fn create_router_with_cache(
         )
         .layer(Extension(db))
         .layer(Extension(cache))
-        .layer(Extension(config));
+        .layer(Extension(config))
+        .layer(Extension(tracker));
 
-    // The signature layer is added last so it runs *first* — verification
-    // happens before any handler (or its body extractor) sees the request.
     let router = match verifier {
         Some(verifier) => router.layer(axum::middleware::from_fn_with_state(
             verifier,
@@ -219,8 +226,6 @@ pub fn create_router_with_cache(
         None => router,
     };
 
-    // Timeout is the outermost layer so it also bounds the auth middleware and
-    // body extraction, not just the leaf handler.
     router.layer(TimeoutLayer::new(request_timeout))
 }
 
@@ -343,6 +348,7 @@ async fn quote_handler(
 #[tracing::instrument(skip(config, tracker), err)]
 async fn deposit_handler(
     Extension(config): Extension<Arc<AppConfig>>,
+    tracker: Extension<Option<Arc<TrackerStore>>>,
     Json(payload): Json<DepositRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -374,6 +380,7 @@ async fn deposit_handler(
 #[tracing::instrument(skip(config, tracker), err)]
 async fn withdraw_handler(
     Extension(config): Extension<Arc<AppConfig>>,
+    tracker: Extension<Option<Arc<TrackerStore>>>,
     Json(payload): Json<WithdrawRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
