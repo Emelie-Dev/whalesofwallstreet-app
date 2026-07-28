@@ -84,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let tracker = db
+        .clone()
+        .map(|d| Arc::new(wow_engine::anchor::tracker::TrackerStore::new(d)));
+
     // 2. Build the Ed25519 signature verifier for internal service-to-service
     //    calls. When no key is configured we run with verification DISABLED and
     //    warn loudly — acceptable for local dev, never for production.
@@ -159,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
     let app = wow_engine::api::create_router_with_cache(
         db,
         verifier,
+        tracker,
         request_timeout,
         cluster_cache,
         config.clone(),

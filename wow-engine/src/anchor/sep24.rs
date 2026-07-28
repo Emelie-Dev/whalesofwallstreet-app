@@ -1,22 +1,19 @@
 use crate::anchor::Sep24InteractiveResponse;
 use reqwest_middleware::ClientWithMiddleware;
+use std::sync::Arc;
 
 pub struct Sep24Client {
     #[allow(dead_code)]
     client: ClientWithMiddleware,
-}
-
-impl Default for Sep24Client {
-    fn default() -> Self {
-        Self::new()
-    }
+    tracker: Arc<super::tracker::TrackerStore>,
 }
 
 impl Sep24Client {
-    pub fn new() -> Self {
+    pub fn new(tracker: Arc<super::tracker::TrackerStore>) -> Self {
         Self {
             client: crate::http_client::build_resilient_client()
                 .expect("Failed to build resilient HTTP client"),
+            tracker,
         }
     }
 
@@ -28,6 +25,7 @@ impl Sep24Client {
         account: &str,
     ) -> Result<Sep24InteractiveResponse, anyhow::Error> {
         self.initiate_flow("deposit", anchor_domain, asset_code, account)
+            .await
     }
 
     #[tracing::instrument(skip(self), err)]
@@ -38,6 +36,7 @@ impl Sep24Client {
         account: &str,
     ) -> Result<Sep24InteractiveResponse, anyhow::Error> {
         self.initiate_flow("withdraw", anchor_domain, asset_code, account)
+            .await
     }
 
     /// Shared helper for both deposit and withdrawal interactive flows.
@@ -45,7 +44,7 @@ impl Sep24Client {
     /// Generates a transaction ID, stores the pending transaction in the global
     /// tracker, and constructs the SEP-24 interactive redirect URL for the client.
     #[tracing::instrument(skip(self), err)]
-    fn initiate_flow(
+    async fn initiate_flow(
         &self,
         kind: &str,
         anchor_domain: &str,
@@ -54,14 +53,16 @@ impl Sep24Client {
     ) -> Result<Sep24InteractiveResponse, anyhow::Error> {
         let tx_id = format!("tx_sep24_{}", super::generate_uuid());
 
-        super::tracker::insert_transaction(super::tracker::Transaction {
-            id: tx_id.clone(),
-            status: "pending_user_transfer_start".to_string(),
-            asset_code: asset_code.to_string(),
-            account: account.to_string(),
-            amount_in: None,
-            amount_out: None,
-        });
+        self.tracker
+            .insert_transaction(super::tracker::Transaction {
+                id: tx_id.clone(),
+                status: "pending_user_transfer_start".to_string(),
+                asset_code: asset_code.to_string(),
+                account: account.to_string(),
+                amount_in: None,
+                amount_out: None,
+            })
+            .await?;
 
         let interactive_url = format!(
             "https://{}/sep24/interactive/{}?asset_code={}&account={}&transaction_id={}&callback=postMessage",

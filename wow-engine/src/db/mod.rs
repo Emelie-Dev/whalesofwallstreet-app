@@ -54,6 +54,10 @@ impl Database {
         sqlx::query("SELECT 1").fetch_one(&self.pool.0).await?;
         Ok(())
     }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool.0
+    }
 }
 
 #[cfg(test)]
