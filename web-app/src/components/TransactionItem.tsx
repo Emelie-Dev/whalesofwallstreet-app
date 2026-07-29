@@ -1,8 +1,9 @@
+import { memo } from "react";
 import { useTheme } from "../ThemeContext";
 import { type Transaction } from "../data/mockData";
 import { Ionicons } from "./Ionicons";
 
-export const TransactionItem = ({ transaction, onClick }: { transaction: Transaction; onClick: () => void }) => {
+export const TransactionItem = memo(({ transaction, onClick }: { transaction: Transaction; onClick: () => void }) => {
   const { c } = useTheme();
   const isReceived = transaction.type === "received";
 
@@ -71,4 +72,4 @@ export const TransactionItem = ({ transaction, onClick }: { transaction: Transac
       </div>
     </div>
   );
-};
+});
