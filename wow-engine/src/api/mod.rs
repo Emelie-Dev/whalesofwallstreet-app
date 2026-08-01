@@ -287,7 +287,7 @@ async fn health_handler() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "wow-engine",
-        version: "0.1.0",
+        version: env!("CARGO_PKG_VERSION"),
         timestamp: chrono::Utc::now().to_rfc3339(),
     })
 }
