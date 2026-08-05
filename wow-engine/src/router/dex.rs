@@ -12,10 +12,31 @@ pub struct DexQuote {
     pub estimated_fee_usd: f64,
     pub duration_seconds: u64,
     /// Exact constant-product price impact of this swap, in basis points.
+    /// For a split trade this is the average impact across tranches.
     pub price_impact_bps: u32,
     /// Dynamic slippage tolerance derived from the price impact.
     pub slippage_bps: u32,
+    /// True if this trade was large enough to be automatically split into
+    /// multiple tranches to reduce its blended price impact.
+    pub is_split: bool,
+    /// Number of tranches the trade was executed as. `1` for a normal,
+    /// unsplit swap.
+    pub tranches: u32,
 }
+
+/// Trades whose single-shot price impact would exceed this get automatically
+/// split into several tranches against the same pool to reduce the blended
+/// cost, instead of being quoted at one punishing price. This sits well
+/// below [`slippage::MAX_PRICE_IMPACT_BPS`] on purpose: splitting improves
+/// pricing for large trades, it does not rescue trades the catastrophic-
+/// impact ceiling deliberately rejects.
+pub const ORDER_SPLIT_THRESHOLD_BPS: u32 = 500;
+
+/// Tranche counts tried, in increasing order, when a trade needs splitting.
+/// Stops at the first one whose blended impact drops back under
+/// [`ORDER_SPLIT_THRESHOLD_BPS`]; falls back to the largest candidate
+/// otherwise (still strictly better than not splitting at all).
+const SPLIT_TRANCHE_CANDIDATES: [u32; 3] = [4, 8, 16];
 
 pub struct DexProvider;
 
@@ -61,12 +82,34 @@ impl DexProvider {
         let estimate =
             slippage::estimate_swap(amount_in as f64, reserves).map_err(anyhow::Error::new)?;
 
+        // Large-but-not-catastrophic trades get automatically split into
+        // tranches against the same pool: each smaller leg has a smaller
+        // individual price impact, so the blended output is strictly better
+        // than quoting the whole amount at once.
+        let (amount_out, price_impact_bps, slippage_bps, tranches) =
+            if estimate.price_impact_bps > ORDER_SPLIT_THRESHOLD_BPS {
+                let split = Self::best_split(amount_in as f64, reserves)?;
+                (
+                    split.amount_out,
+                    split.price_impact_bps,
+                    split.recommended_slippage_bps,
+                    split.tranches,
+                )
+            } else {
+                (
+                    estimate.amount_out,
+                    estimate.price_impact_bps,
+                    estimate.recommended_slippage_bps,
+                    1,
+                )
+            };
+
         // Full execution cost of the leg: USD value in minus the USD value
         // of the simulated AMM output. This covers both the LP fee and the
         // value lost to price impact, so it reconciles exactly with
         // amount_out.
         let value_in_usd = (amount_in as f64) * price_in;
-        let fee_usd = value_in_usd - estimate.amount_out * price_out;
+        let fee_usd = value_in_usd - amount_out * price_out;
 
         Ok(DexQuote {
             provider: provider_name.to_string(),
@@ -74,12 +117,34 @@ impl DexProvider {
             source_asset: source_asset.to_string(),
             dest_asset: dest_asset.to_string(),
             amount_in,
-            amount_out: estimate.amount_out as u64,
+            amount_out: amount_out as u64,
             estimated_fee_usd: fee_usd,
             duration_seconds: 5,
-            price_impact_bps: estimate.price_impact_bps,
-            slippage_bps: estimate.recommended_slippage_bps,
+            price_impact_bps,
+            slippage_bps,
+            is_split: tranches > 1,
+            tranches,
         })
+    }
+
+    /// Tries increasing tranche counts and returns the first whose blended
+    /// price impact drops back under [`ORDER_SPLIT_THRESHOLD_BPS`], or the
+    /// result of the largest candidate tried if none get there.
+    fn best_split(
+        amount_in: f64,
+        reserves: PoolReserves,
+    ) -> Result<slippage::SplitSwapEstimate, anyhow::Error> {
+        let mut best: Option<slippage::SplitSwapEstimate> = None;
+        for &tranches in &SPLIT_TRANCHE_CANDIDATES {
+            let split = slippage::estimate_split_swap(amount_in, reserves, tranches)
+                .map_err(anyhow::Error::new)?;
+            let good_enough = split.price_impact_bps <= ORDER_SPLIT_THRESHOLD_BPS;
+            best = Some(split);
+            if good_enough {
+                break;
+            }
+        }
+        Ok(best.expect("SPLIT_TRANCHE_CANDIDATES is non-empty"))
     }
 }
 
@@ -121,6 +186,48 @@ mod tests {
         // The reconciled fee must exceed the flat LP fee alone, since this
         // trade has significant price impact on top of it.
         assert!(quote.estimated_fee_usd > value_in_usd * 0.003);
+    }
+
+    #[test]
+    fn test_large_trade_is_automatically_split() {
+        // $200k of USDC into Stellar's $2M pool is a ~907 bps lump impact:
+        // well above the 500 bps split threshold, but far short of the
+        // 1500 bps catastrophic ceiling.
+        let lump_impact_only = {
+            let reserves = crate::router::slippage::PoolReserves {
+                reserve_in: 2_000_000.0,
+                reserve_out: 2_000_000.0,
+            };
+            crate::router::slippage::estimate_swap(200_000.0, reserves).unwrap()
+        };
+        assert!(lump_impact_only.price_impact_bps > ORDER_SPLIT_THRESHOLD_BPS);
+
+        let quote = DexProvider::get_swap_quote(Chain::Stellar, "USDC", "XLM", 200_000).unwrap();
+
+        assert!(quote.is_split, "large trade should be split");
+        assert!(quote.tranches > 1);
+        assert!(
+            quote.price_impact_bps < lump_impact_only.price_impact_bps,
+            "splitting should improve the blended price impact over the lump quote"
+        );
+    }
+
+    #[test]
+    fn test_small_trade_is_not_split() {
+        let quote = DexProvider::get_swap_quote(Chain::Ethereum, "USDC", "ETH", 1_000).unwrap();
+        assert!(!quote.is_split);
+        assert_eq!(quote.tranches, 1);
+    }
+
+    #[test]
+    fn test_catastrophic_trade_is_still_rejected_not_rescued_by_splitting() {
+        // Splitting improves pricing for large trades; it must not silently
+        // bypass the hard catastrophic-impact safety ceiling.
+        let err =
+            DexProvider::get_swap_quote(Chain::Stellar, "USDC", "XLM", 1_000_000).unwrap_err();
+        assert!(err
+            .downcast_ref::<crate::router::slippage::SlippageError>()
+            .is_some());
     }
 
     #[test]

@@ -100,6 +100,70 @@ pub fn estimate_swap(
     })
 }
 
+/// Result of simulating a trade executed as several smaller tranches against
+/// the same pool instead of a single lump swap.
+#[derive(Debug, Clone, Copy)]
+pub struct SplitSwapEstimate {
+    /// Average price impact across tranches, in basis points.
+    pub price_impact_bps: u32,
+    /// Slippage tolerance derived from the worst single tranche (the one
+    /// most at risk of failing on-chain) plus the volatility buffer.
+    pub recommended_slippage_bps: u32,
+    /// Simulated output amount summed across every tranche.
+    pub amount_out: f64,
+    /// Number of tranches the order was split into.
+    pub tranches: u32,
+}
+
+/// Simulates `amount_in` as `tranches` equal legs executed sequentially
+/// against the same pool, each leg trading against the reserves left behind
+/// by the one before it — exactly as it would on-chain.
+///
+/// Splitting a trade this way always improves (or matches) the total output
+/// of a single lump swap of the same size: each leg is smaller, so its
+/// individual price impact is smaller, and the constant-product curve is
+/// convex in trade size.
+pub fn estimate_split_swap(
+    amount_in: f64,
+    reserves: PoolReserves,
+    tranches: u32,
+) -> Result<SplitSwapEstimate, SlippageError> {
+    if amount_in <= 0.0 {
+        return Err(SlippageError::ZeroAmount);
+    }
+    if tranches == 0 {
+        return Err(SlippageError::ZeroAmount);
+    }
+    if reserves.reserve_in <= 0.0 || reserves.reserve_out <= 0.0 {
+        return Err(SlippageError::NoLiquidity);
+    }
+
+    let leg_amount = amount_in / tranches as f64;
+    let fee_multiplier = 1.0 - (LP_FEE_BPS as f64) / 10_000.0;
+
+    let mut live_reserves = reserves;
+    let mut total_out = 0.0;
+    let mut max_impact_bps = 0u32;
+    let mut impact_sum_bps: u64 = 0;
+
+    for _ in 0..tranches {
+        let leg = estimate_swap(leg_amount, live_reserves)?;
+        total_out += leg.amount_out;
+        max_impact_bps = max_impact_bps.max(leg.price_impact_bps);
+        impact_sum_bps += leg.price_impact_bps as u64;
+
+        live_reserves.reserve_in += leg_amount * fee_multiplier;
+        live_reserves.reserve_out -= leg.amount_out;
+    }
+
+    Ok(SplitSwapEstimate {
+        price_impact_bps: (impact_sum_bps / tranches as u64) as u32,
+        recommended_slippage_bps: max_impact_bps + VOLATILITY_BUFFER_BPS,
+        amount_out: total_out,
+        tranches,
+    })
+}
+
 /// USD depth of one side of the deepest pool for a pair on a chain.
 ///
 /// Stands in for live reserve queries against DEX APIs, in the same spirit as
@@ -267,6 +331,77 @@ mod tests {
             )
             .unwrap_err(),
             SlippageError::NoLiquidity
+        );
+    }
+
+    #[test]
+    fn test_split_swap_reduces_price_impact_and_improves_output() {
+        let reserves = PoolReserves {
+            reserve_in: 1_000_000.0,
+            reserve_out: 1_000_000.0,
+        };
+        let amount_in = 100_000.0;
+
+        let lump = estimate_swap(amount_in, reserves).unwrap();
+        let split = estimate_split_swap(amount_in, reserves, 4).unwrap();
+
+        assert_eq!(split.tranches, 4);
+        assert!(
+            split.price_impact_bps < lump.price_impact_bps,
+            "splitting should reduce blended price impact: split={} lump={}",
+            split.price_impact_bps,
+            lump.price_impact_bps
+        );
+        assert!(
+            split.amount_out > lump.amount_out,
+            "splitting should yield more output for the same input"
+        );
+    }
+
+    #[test]
+    fn test_more_tranches_keep_improving_output() {
+        let reserves = PoolReserves {
+            reserve_in: 1_000_000.0,
+            reserve_out: 1_000_000.0,
+        };
+        let amount_in = 200_000.0;
+
+        let split_4 = estimate_split_swap(amount_in, reserves, 4).unwrap();
+        let split_16 = estimate_split_swap(amount_in, reserves, 16).unwrap();
+
+        assert!(split_16.amount_out > split_4.amount_out);
+        assert!(split_16.price_impact_bps < split_4.price_impact_bps);
+    }
+
+    #[test]
+    fn test_split_swap_can_escape_catastrophic_rejection() {
+        // A single $250k trade against $1M reserves is a catastrophic
+        // ~20%+ impact (rejected by estimate_swap). Split into enough
+        // tranches, each leg's impact drops below the rejection ceiling.
+        let reserves = PoolReserves {
+            reserve_in: 1_000_000.0,
+            reserve_out: 1_000_000.0,
+        };
+        let amount_in = 250_000.0;
+
+        assert!(estimate_swap(amount_in, reserves).is_err());
+        let split = estimate_split_swap(amount_in, reserves, 16).unwrap();
+        assert!(split.price_impact_bps < MAX_PRICE_IMPACT_BPS);
+    }
+
+    #[test]
+    fn test_split_swap_invalid_inputs_are_rejected() {
+        let reserves = PoolReserves {
+            reserve_in: 1_000.0,
+            reserve_out: 1_000.0,
+        };
+        assert_eq!(
+            estimate_split_swap(0.0, reserves, 4).unwrap_err(),
+            SlippageError::ZeroAmount
+        );
+        assert_eq!(
+            estimate_split_swap(100.0, reserves, 0).unwrap_err(),
+            SlippageError::ZeroAmount
         );
     }
 

@@ -27,6 +27,9 @@ pub struct RouteOption {
     /// and trade size rather than a static default. Surfaced so the
     /// frontend can warn the user before execution.
     pub slippage_bps: u32,
+    /// True if any leg of this route was large enough to be automatically
+    /// split into multiple tranches to reduce its blended price impact.
+    pub is_split_route: bool,
     pub execution_payload: Option<String>,
 }
 
@@ -170,6 +173,7 @@ impl RoutePlanner {
                     // the 15% rejection ceiling.
                     let total_impact = state.route_so_far.iter().map(|r| r.price_impact_bps).sum();
                     let total_slippage = state.route_so_far.iter().map(|r| r.slippage_bps).sum();
+                    let any_split = state.route_so_far.iter().any(|r| r.is_split_route);
 
                     final_routes.push(RouteOption {
                         provider: combined_provider,
@@ -180,6 +184,7 @@ impl RoutePlanner {
                         duration_seconds: total_duration,
                         price_impact_bps: total_impact,
                         slippage_bps: total_slippage,
+                        is_split_route: any_split,
                         execution_payload: None,
                     });
                 }
@@ -221,6 +226,7 @@ impl RoutePlanner {
                                     duration_seconds: quote.duration_seconds,
                                     price_impact_bps: quote.price_impact_bps,
                                     slippage_bps: quote.slippage_bps,
+                                    is_split_route: quote.is_split,
                                     execution_payload: None,
                                 });
                                 pq.push(State {
@@ -292,6 +298,7 @@ impl RoutePlanner {
                                     // against a pool, so no price impact.
                                     price_impact_bps: 0,
                                     slippage_bps: 0,
+                                    is_split_route: false,
                                     execution_payload: quote.execution_payload,
                                 });
                                 pq.push(State {
@@ -341,6 +348,7 @@ impl RoutePlanner {
                                 duration_seconds: quote.duration_seconds,
                                 price_impact_bps: 0,
                                 slippage_bps: 0,
+                                is_split_route: false,
                                 execution_payload: quote.execution_payload,
                             });
                             pq.push(State {
@@ -398,6 +406,24 @@ mod tests {
         );
 
         assert!(!routes.is_empty(), "Should find at least one route");
+    }
+
+    #[tokio::test]
+    async fn test_large_same_chain_swap_is_routed_as_a_split() {
+        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
+        // 1000 ETH into Ethereum's $50M-deep ETH/USDC pool has a lump price
+        // impact just over the 500 bps split threshold but nowhere near the
+        // 1500 bps catastrophic ceiling, so it should route as a split.
+        let routes = planner
+            .find_best_route(Chain::Ethereum, Chain::Ethereum, "ETH", "USDC", 1000)
+            .await
+            .unwrap();
+
+        assert!(!routes.is_empty());
+        assert!(
+            routes.iter().any(|r| r.is_split_route),
+            "a large single-chain swap should be routed with order splitting"
+        );
     }
 
     #[tokio::test]
