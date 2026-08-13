@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tower_http::timeout::TimeoutLayer;
-use uuid::Uuid;
 
 /// Default per-request timeout applied when [`create_router`] is used without an
 /// explicit value. Kept in sync with [`crate::config::AppConfig`]'s default.
@@ -28,9 +27,14 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub mod auth;
 pub mod middleware;
+pub mod validated_request;
 pub mod validation;
 use auth::SignatureVerifier;
-use validation::{validate_anchor_domain, validate_asset_code, validate_stellar_address};
+use validated_request::{
+    ValidatedAnchorQuoteRequest, ValidatedDepositRequest, ValidatedExecuteRouteRequest,
+    ValidatedQuoteRequest, ValidatedWithdrawRequest,
+};
+use validation::validate_anchor_domain;
 
 #[derive(Serialize)]
 pub struct ConfigResponse {
@@ -39,40 +43,9 @@ pub struct ConfigResponse {
     pub bridges: Vec<&'static str>,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct QuoteRequest {
-    pub source_chain: Chain,
-    pub dest_chain: Chain,
-    pub source_asset: String,
-    pub dest_asset: String,
-    pub amount_in: u64,
-}
-
 #[derive(Serialize)]
 pub struct QuoteResponse {
     pub routes: Vec<RouteOption>,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct DepositRequest {
-    pub anchor_domain: String,
-    pub asset_code: String,
-    pub account: String,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct WithdrawRequest {
-    pub anchor_domain: String,
-    pub asset_code: String,
-    pub account: String,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct AnchorQuoteRequest {
-    pub anchor_domain: String,
-    pub sell_asset: String,
-    pub buy_asset: String,
-    pub sell_amount: f64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -92,22 +65,6 @@ pub struct VerifyAttestationResponse {
     pub source_domain: u32,
     pub destination_domain: u32,
     pub nonce: u64,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct ExecuteRouteRequest {
-    pub user_id: Uuid,
-    pub source_chain: String,
-    pub dest_chain: String,
-    pub source_asset: String,
-    pub dest_asset: String,
-    pub amount_in: u64,
-    pub amount_out: u64,
-    pub provider: String,
-    pub path: String,
-    pub estimated_fee_usd: f64,
-    pub anchor_domain: Option<String>,
-    pub anchor_transaction_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -304,38 +261,20 @@ async fn config_handler() -> Json<ConfigResponse> {
 async fn quote_handler(
     Extension(cache): Extension<ClusterCache>,
     Extension(config): Extension<Arc<AppConfig>>,
-    Json(payload): Json<QuoteRequest>,
+    Json(req): Json<ValidatedQuoteRequest>,
 ) -> Result<Json<QuoteResponse>, AppError> {
-    if payload.source_asset.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "Source asset cannot be empty".to_string(),
-        ));
-    }
-    if payload.dest_asset.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "Destination asset cannot be empty".to_string(),
-        ));
-    }
-    if payload.amount_in == 0 {
-        return Err(AppError::BadRequest(
-            "Amount in must be greater than zero".to_string(),
-        ));
-    }
-
+    req.validate()?;
     let planner = RoutePlanner::with_gas_oracle(cache.gas_oracle.clone(), config);
     let routes = planner
         .find_best_route(
-            payload.source_chain,
-            payload.dest_chain,
-            &payload.source_asset,
-            &payload.dest_asset,
-            payload.amount_in,
+            req.source_chain,
+            req.dest_chain,
+            &req.source_asset,
+            &req.dest_asset,
+            req.amount_in,
         )
         .await
         .map_err(|err| {
-            // A catastrophic price-impact rejection is a property of the
-            // requested trade, not an engine failure: report it as a 400
-            // with the explanatory message.
             if err.downcast_ref::<SlippageError>().is_some() {
                 AppError::BadRequest(err.to_string())
             } else {
@@ -349,20 +288,14 @@ async fn quote_handler(
 async fn deposit_handler(
     Extension(config): Extension<Arc<AppConfig>>,
     tracker: Extension<Option<Arc<TrackerStore>>>,
-    Json(payload): Json<DepositRequest>,
+    ValidatedDepositRequest {
+        anchor_domain,
+        asset_code,
+        account,
+    }: ValidatedDepositRequest,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
-    if let Err(err) = validate_stellar_address(&payload.account) {
-        return Err(AppError::BadRequest(format!(
-            "Invalid account address: {}",
-            err
-        )));
-    }
-    if let Err(err) = validate_asset_code(&payload.asset_code) {
-        return Err(AppError::BadRequest(format!("Invalid asset code: {}", err)));
-    }
-    let valid_domain =
-        validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
-            .map_err(AppError::BadRequest)?;
+    let valid_domain = validate_anchor_domain(&anchor_domain, &config.allowed_anchor_domains)
+        .map_err(AppError::BadRequest)?;
 
     let tracker = tracker.0.ok_or_else(|| {
         AppError::Internal(anyhow::anyhow!(
@@ -372,7 +305,7 @@ async fn deposit_handler(
 
     let client = Sep24Client::new(tracker);
     let tx = client
-        .initiate_deposit(&valid_domain, &payload.asset_code, &payload.account)
+        .initiate_deposit(&valid_domain, &asset_code, &account)
         .await?;
     Ok(Json(tx))
 }
@@ -381,20 +314,14 @@ async fn deposit_handler(
 async fn withdraw_handler(
     Extension(config): Extension<Arc<AppConfig>>,
     tracker: Extension<Option<Arc<TrackerStore>>>,
-    Json(payload): Json<WithdrawRequest>,
+    ValidatedWithdrawRequest {
+        anchor_domain,
+        asset_code,
+        account,
+    }: ValidatedWithdrawRequest,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
-    if let Err(err) = validate_stellar_address(&payload.account) {
-        return Err(AppError::BadRequest(format!(
-            "Invalid account address: {}",
-            err
-        )));
-    }
-    if let Err(err) = validate_asset_code(&payload.asset_code) {
-        return Err(AppError::BadRequest(format!("Invalid asset code: {}", err)));
-    }
-    let valid_domain =
-        validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
-            .map_err(AppError::BadRequest)?;
+    let valid_domain = validate_anchor_domain(&anchor_domain, &config.allowed_anchor_domains)
+        .map_err(AppError::BadRequest)?;
 
     let tracker = tracker.0.ok_or_else(|| {
         AppError::Internal(anyhow::anyhow!(
@@ -404,7 +331,7 @@ async fn withdraw_handler(
 
     let client = Sep24Client::new(tracker);
     let tx = client
-        .initiate_withdrawal(&valid_domain, &payload.asset_code, &payload.account)
+        .initiate_withdrawal(&valid_domain, &asset_code, &account)
         .await?;
     Ok(Json(tx))
 }
@@ -412,31 +339,19 @@ async fn withdraw_handler(
 #[tracing::instrument(skip(config), err)]
 async fn anchor_quote_handler(
     Extension(config): Extension<Arc<AppConfig>>,
-    Json(payload): Json<AnchorQuoteRequest>,
+    ValidatedAnchorQuoteRequest {
+        anchor_domain,
+        sell_asset,
+        buy_asset,
+        sell_amount,
+    }: ValidatedAnchorQuoteRequest,
 ) -> Result<Json<Sep38Quote>, AppError> {
-    if let Err(err) = validate_asset_code(&payload.sell_asset) {
-        return Err(AppError::BadRequest(format!("Invalid sell asset: {}", err)));
-    }
-    if let Err(err) = validate_asset_code(&payload.buy_asset) {
-        return Err(AppError::BadRequest(format!("Invalid buy asset: {}", err)));
-    }
-    if payload.sell_amount <= 0.0 {
-        return Err(AppError::BadRequest(
-            "Sell amount must be greater than zero".to_string(),
-        ));
-    }
-    let valid_domain =
-        validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
-            .map_err(AppError::BadRequest)?;
+    let valid_domain = validate_anchor_domain(&anchor_domain, &config.allowed_anchor_domains)
+        .map_err(AppError::BadRequest)?;
 
     let client = Sep38Client::new();
     let quote = client
-        .get_indicative_quote(
-            &valid_domain,
-            &payload.sell_asset,
-            &payload.buy_asset,
-            payload.sell_amount,
-        )
+        .get_indicative_quote(&valid_domain, &sell_asset, &buy_asset, sell_amount)
         .await?;
     Ok(Json(quote))
 }
@@ -444,7 +359,20 @@ async fn anchor_quote_handler(
 #[tracing::instrument(skip(db), err)]
 async fn execute_route_handler(
     Extension(db): Extension<Option<Database>>,
-    Json(payload): Json<ExecuteRouteRequest>,
+    ValidatedExecuteRouteRequest {
+        user_id,
+        source_chain,
+        dest_chain,
+        source_asset,
+        dest_asset,
+        amount_in,
+        amount_out,
+        provider,
+        path,
+        estimated_fee_usd,
+        anchor_domain,
+        anchor_transaction_id,
+    }: ValidatedExecuteRouteRequest,
 ) -> Result<Json<ExecuteRouteResult>, AppError> {
     let db = db.ok_or_else(|| {
         AppError::Internal(anyhow::anyhow!(
@@ -452,40 +380,24 @@ async fn execute_route_handler(
         ))
     })?;
 
-    if payload.amount_in == 0 {
-        return Err(AppError::BadRequest(
-            "Amount in must be greater than zero".to_string(),
-        ));
-    }
-    if payload.amount_out == 0 {
-        return Err(AppError::BadRequest(
-            "Amount out must be greater than zero".to_string(),
-        ));
-    }
-    if payload.estimated_fee_usd < 0.0 {
-        return Err(AppError::BadRequest(
-            "Estimated fee cannot be negative".to_string(),
-        ));
-    }
-
     let route_input = RouteExecutionInput {
-        user_id: payload.user_id,
-        source_chain: payload.source_chain,
-        dest_chain: payload.dest_chain,
-        source_asset: payload.source_asset,
-        dest_asset: payload.dest_asset,
-        amount_in: payload.amount_in as i64,
-        amount_out: payload.amount_out as i64,
-        provider: payload.provider,
-        path: payload.path,
-        estimated_fee_usd: payload.estimated_fee_usd,
+        user_id,
+        source_chain: source_chain.to_string(),
+        dest_chain: dest_chain.to_string(),
+        source_asset,
+        dest_asset,
+        amount_in: amount_in as i64,
+        amount_out: amount_out as i64,
+        provider,
+        path,
+        estimated_fee_usd,
     };
 
     let result = RouteExecutionService::execute_route_with_quota(
         &db,
         route_input,
-        payload.anchor_domain.as_deref(),
-        payload.anchor_transaction_id.as_deref(),
+        anchor_domain.as_deref(),
+        anchor_transaction_id.as_deref(),
     )
     .await
     .map_err(map_route_execution_error)?;
@@ -533,26 +445,22 @@ pub(crate) fn map_route_execution_error(err: Box<dyn std::error::Error>) -> AppE
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::api::validation::{validate_asset_code, validate_stellar_address};
 
     #[test]
     fn test_validate_stellar_address() {
-        // Valid address (only A-Z and 2-7, length 56, starts with G)
         assert!(validate_stellar_address(
             "GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK"
         )
         .is_ok());
 
-        // Invalid starting char
         assert!(validate_stellar_address(
             "SA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK"
         )
         .is_err());
 
-        // Invalid length
         assert!(validate_stellar_address("GA5Z3IX5").is_err());
 
-        // Invalid characters (e.g. contains 0, 1, 8, 9)
         assert!(validate_stellar_address(
             "GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JA0K"
         )
@@ -561,12 +469,10 @@ mod tests {
 
     #[test]
     fn test_validate_asset_code() {
-        // Alphanumeric standard
         assert!(validate_asset_code("USDC").is_ok());
         assert!(validate_asset_code("XLM").is_ok());
         assert!(validate_asset_code("EURT").is_ok());
 
-        // Fully qualified
         assert!(validate_asset_code(
             "stellar:USDC:GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK"
         )
@@ -580,12 +486,10 @@ mod tests {
         )
         .is_err());
 
-        // ISO-4217 format
         assert!(validate_asset_code("iso4217:USD").is_ok());
         assert!(validate_asset_code("iso4217:NGN").is_ok());
         assert!(validate_asset_code("iso4217:US").is_err());
 
-        // Empty & too long
         assert!(validate_asset_code("").is_err());
         assert!(validate_asset_code("VERYLONGASSETCODE").is_err());
     }
