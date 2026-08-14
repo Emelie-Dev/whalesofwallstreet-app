@@ -4,7 +4,7 @@ use wow_engine::api::create_router;
 
 #[tokio::test]
 async fn test_health_endpoint() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     let response = server.get("/api/v1/health").await;
@@ -17,7 +17,7 @@ async fn test_health_endpoint() {
 
 #[tokio::test]
 async fn test_quote_endpoint_bad_request() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     // 0 amount should trigger a validation error
@@ -38,7 +38,7 @@ async fn test_quote_endpoint_bad_request() {
 
 #[tokio::test]
 async fn test_verify_attestation_endpoint_rejects_invalid_hex() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     let payload = json!({
@@ -57,7 +57,7 @@ async fn test_verify_attestation_endpoint_rejects_invalid_hex() {
 
 #[tokio::test]
 async fn test_verify_attestation_endpoint_rejects_malformed_attestation() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     // Structurally invalid: 64 bytes is not a whole number of 65-byte
@@ -81,7 +81,7 @@ async fn test_verify_attestation_endpoint_rejects_malformed_attestation() {
 
 #[tokio::test]
 async fn test_quote_endpoint_exposes_dynamic_slippage() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     let payload = json!({
@@ -110,7 +110,7 @@ async fn test_quote_endpoint_exposes_dynamic_slippage() {
 
 #[tokio::test]
 async fn test_quote_endpoint_rejects_catastrophic_price_impact() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     // ~$180M of ETH exceeds the 15% price-impact ceiling on every pool.
@@ -132,7 +132,7 @@ async fn test_quote_endpoint_rejects_catastrophic_price_impact() {
 
 #[tokio::test]
 async fn test_deposit_endpoint_invalid_address() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     let payload = json!({
@@ -150,7 +150,7 @@ async fn test_deposit_endpoint_invalid_address() {
 
 #[tokio::test]
 async fn test_admin_invalidate_cache_endpoint_invalidates_specific_chain() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     let response = server
@@ -168,7 +168,7 @@ async fn test_admin_invalidate_cache_endpoint_invalidates_specific_chain() {
 
 #[tokio::test]
 async fn test_admin_invalidate_cache_endpoint_invalidates_all_when_chain_omitted() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     let response = server
@@ -184,7 +184,7 @@ async fn test_admin_invalidate_cache_endpoint_invalidates_all_when_chain_omitted
 
 #[tokio::test]
 async fn test_admin_invalidate_cache_endpoint_rejects_unknown_chain() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     let response = server
@@ -198,7 +198,7 @@ async fn test_admin_invalidate_cache_endpoint_rejects_unknown_chain() {
 
 #[tokio::test]
 async fn test_anchor_quote_invalid_amount() {
-    let app = create_router(None, None, None);
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     let payload = json!({

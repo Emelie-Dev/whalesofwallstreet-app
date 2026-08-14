@@ -1,6 +1,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 use wow_engine::bridge::Chain;
+use wow_engine::config::AppConfig;
 use wow_engine::router::RoutePlanner;
 
 fn bench_router(c: &mut Criterion) {
@@ -8,7 +10,7 @@ fn bench_router(c: &mut Criterion) {
     std::env::set_var("MOCK_GAS_ORACLE", "true");
 
     let rt = Runtime::new().unwrap();
-    let planner = RoutePlanner::new();
+    let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
 
     let mut group = c.benchmark_group("routing_engine");
     group.sample_size(100);
@@ -39,7 +41,7 @@ fn bench_router(c: &mut Criterion) {
                     "USDC",
                     "USDC",
                     10000000, // high liquidity/amount
-                    true, // multi_path = true
+                    true,     // multi_path = true
                 )
                 .await;
         });
@@ -78,6 +80,14 @@ fn bench_router(c: &mut Criterion) {
     });
 
     group.finish();
+
+    // `RoutePlanner` holds a `DeBridgeClient` whose `Drop` impl calls
+    // `tokio::spawn`, which panics outside a runtime context. Drop it here,
+    // inside the runtime, instead of letting it fall out of scope after
+    // `rt` when the function returns.
+    rt.block_on(async move {
+        drop(planner);
+    });
 }
 
 criterion_group!(benches, bench_router);

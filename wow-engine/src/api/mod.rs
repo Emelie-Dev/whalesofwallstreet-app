@@ -1,18 +1,29 @@
+use crate::anchor::tracker::TrackerStore;
 use crate::anchor::{sep24::Sep24Client, sep38::Sep38Client, Sep24InteractiveResponse, Sep38Quote};
+use crate::bridge::attestation::AttestationError;
+use crate::bridge::cctp::CctpClient;
+use crate::bridge::gas_oracle::GasOracle;
 use crate::bridge::Chain;
+use crate::cache_sync::{ClusterCache, InvalidationMessage};
+use crate::config::AppConfig;
 use crate::db::models::RouteExecutionInput;
 use crate::db::service::{ExecuteRouteResult, RouteExecutionService};
 use crate::db::Database;
 use crate::error::AppError;
+use crate::router::slippage::SlippageError;
 use crate::router::{RouteOption, RoutePlanner};
 use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
+use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
 pub mod auth;
+pub mod middleware;
 pub mod validation;
 use auth::SignatureVerifier;
 use validation::{validate_asset_code, validate_stellar_address};
@@ -70,6 +81,40 @@ pub struct ExecuteRouteRequest {
 }
 
 #[derive(Serialize)]
+pub struct ConfigResponse {
+    pub chains: Vec<&'static str>,
+    pub assets: Vec<&'static str>,
+    pub bridges: Vec<&'static str>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct InvalidateCacheRequest {
+    #[serde(default)]
+    pub chain: Option<Chain>,
+}
+
+#[derive(Serialize)]
+pub struct InvalidateCacheResponse {
+    pub invalidated: &'static str,
+    pub broadcast: bool,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct VerifyAttestationRequest {
+    pub dest_chain: Chain,
+    pub message: String,
+    pub attestation: String,
+}
+
+#[derive(Serialize)]
+pub struct VerifyAttestationResponse {
+    pub verified: bool,
+    pub source_domain: u32,
+    pub destination_domain: u32,
+    pub nonce: u64,
+}
+
+#[derive(Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
     pub service: &'static str,
@@ -85,24 +130,59 @@ pub struct HealthResponse {
 /// signature; when `None`, verification is disabled entirely (intended only for
 /// local development — see `main`, which warns loudly in that case).
 pub fn create_router(db: Option<Database>, verifier: Option<SignatureVerifier>) -> Router {
+    create_router_with_cache(
+        db,
+        verifier,
+        None,
+        Duration::from_secs(30),
+        ClusterCache::local_only(),
+        Arc::new(AppConfig::default()),
+    )
+}
+
+pub fn create_router_with_cache(
+    db: Option<Database>,
+    verifier: Option<SignatureVerifier>,
+    tracker: Option<Arc<TrackerStore>>,
+    request_timeout: Duration,
+    cache: ClusterCache,
+    config: Arc<AppConfig>,
+) -> Router {
     let router = Router::new()
         .route("/api/v1/health", get(health_handler))
+        .route(
+            "/api/v1/config",
+            get(config_handler).layer(axum::middleware::from_fn(middleware::etag_middleware)),
+        )
         .route("/api/v1/quote", post(quote_handler))
         .route("/api/v1/execute-route", post(execute_route_handler))
         .route("/api/v1/anchor/deposit", post(deposit_handler))
         .route("/api/v1/anchor/withdraw", post(withdraw_handler))
         .route("/api/v1/anchor/quote", post(anchor_quote_handler))
-        .layer(Extension(db));
+        .route(
+            "/api/v1/admin/invalidate-cache",
+            post(admin_invalidate_cache_handler),
+        )
+        .route(
+            "/api/v1/cctp/verify-attestation",
+            post(verify_attestation_handler),
+        )
+        .layer(Extension(db))
+        .layer(Extension(cache))
+        .layer(Extension(config))
+        .layer(Extension(tracker));
 
     // The signature layer is added last so it runs *first* — verification
     // happens before any handler (or its body extractor) sees the request.
-    match verifier {
+    let router = match verifier {
         Some(verifier) => router.layer(axum::middleware::from_fn_with_state(
             verifier,
             auth::verify_signature,
         )),
         None => router,
-    }
+    };
+
+    router.layer(TimeoutLayer::new(request_timeout))
 }
 
 async fn health_handler() -> Json<HealthResponse> {
@@ -115,7 +195,10 @@ async fn health_handler() -> Json<HealthResponse> {
 }
 
 #[tracing::instrument(err)]
-async fn quote_handler(Json(payload): Json<QuoteRequest>) -> Result<Json<QuoteResponse>, AppError> {
+async fn quote_handler(
+    Extension(config): Extension<Arc<AppConfig>>,
+    Json(payload): Json<QuoteRequest>,
+) -> Result<Json<QuoteResponse>, AppError> {
     if payload.source_asset.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Source asset cannot be empty".to_string(),
@@ -132,7 +215,7 @@ async fn quote_handler(Json(payload): Json<QuoteRequest>) -> Result<Json<QuoteRe
         ));
     }
 
-    let planner = RoutePlanner::new();
+    let planner = RoutePlanner::new(config);
     let routes = planner
         .find_best_route(
             payload.source_chain,
@@ -142,12 +225,23 @@ async fn quote_handler(Json(payload): Json<QuoteRequest>) -> Result<Json<QuoteRe
             payload.amount_in,
             false,
         )
-        .await?;
+        .await
+        .map_err(|err| {
+            // A catastrophic price-impact rejection is a property of the
+            // requested trade, not an engine failure: report it as a 400
+            // with the explanatory message.
+            if err.downcast_ref::<SlippageError>().is_some() {
+                AppError::BadRequest(err.to_string())
+            } else {
+                AppError::Internal(err)
+            }
+        })?;
     Ok(Json(QuoteResponse { routes }))
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(skip(tracker), err)]
 async fn deposit_handler(
+    tracker: Extension<Option<Arc<TrackerStore>>>,
     Json(payload): Json<DepositRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -165,7 +259,13 @@ async fn deposit_handler(
         ));
     }
 
-    let client = Sep24Client::new();
+    let tracker = tracker.0.ok_or_else(|| {
+        AppError::Internal(anyhow::anyhow!(
+            "Database not configured for anchor tracker"
+        ))
+    })?;
+
+    let client = Sep24Client::new(tracker);
     let tx = client
         .initiate_deposit(
             &payload.anchor_domain,
@@ -176,8 +276,9 @@ async fn deposit_handler(
     Ok(Json(tx))
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(skip(tracker), err)]
 async fn withdraw_handler(
+    tracker: Extension<Option<Arc<TrackerStore>>>,
     Json(payload): Json<WithdrawRequest>,
 ) -> Result<Json<Sep24InteractiveResponse>, AppError> {
     if let Err(err) = validate_stellar_address(&payload.account) {
@@ -195,7 +296,13 @@ async fn withdraw_handler(
         ));
     }
 
-    let client = Sep24Client::new();
+    let tracker = tracker.0.ok_or_else(|| {
+        AppError::Internal(anyhow::anyhow!(
+            "Database not configured for anchor tracker"
+        ))
+    })?;
+
+    let client = Sep24Client::new(tracker);
     let tx = client
         .initiate_withdrawal(
             &payload.anchor_domain,
@@ -289,6 +396,62 @@ async fn execute_route_handler(
     .map_err(|e| AppError::BadRequest(format!("Route execution failed: {}", e)))?;
 
     Ok(Json(result))
+}
+
+async fn config_handler() -> Json<ConfigResponse> {
+    Json(ConfigResponse {
+        chains: vec!["Ethereum", "Arbitrum", "Solana", "Stellar"],
+        assets: vec!["ETH", "USDC", "SOL", "XLM"],
+        bridges: vec!["deBridge", "CCTP"],
+    })
+}
+
+async fn admin_invalidate_cache_handler(
+    Extension(cache): Extension<ClusterCache>,
+    Json(payload): Json<InvalidateCacheRequest>,
+) -> Result<Json<InvalidateCacheResponse>, AppError> {
+    let (message, invalidated) = match payload.chain {
+        Some(chain) => (InvalidationMessage::InvalidateChain { chain }, "chain"),
+        None => (InvalidationMessage::InvalidateAll, "all"),
+    };
+    let broadcast = cache.broadcaster.is_some();
+
+    cache.invalidate(message).await;
+
+    Ok(Json(InvalidateCacheResponse {
+        invalidated,
+        broadcast,
+    }))
+}
+
+fn decode_hex_field(value: &str, field: &str) -> Result<Vec<u8>, AppError> {
+    hex::decode(value.trim_start_matches("0x"))
+        .map_err(|err| AppError::BadRequest(format!("Invalid hex in {field}: {err}")))
+}
+
+async fn verify_attestation_handler(
+    Extension(config): Extension<Arc<AppConfig>>,
+    Json(payload): Json<VerifyAttestationRequest>,
+) -> Result<Json<VerifyAttestationResponse>, AppError> {
+    let message = decode_hex_field(&payload.message, "message")?;
+    let attestation = decode_hex_field(&payload.attestation, "attestation")?;
+
+    let parsed = CctpClient::new(Arc::new(GasOracle::new(config.clone())), config)
+        .verify_attestation(payload.dest_chain, &message, &attestation)
+        .await
+        .map_err(|err| match err {
+            AttestationError::KeySourceUnavailable | AttestationError::NonceStoreUnavailable(_) => {
+                AppError::Internal(anyhow::Error::new(err))
+            }
+            other => AppError::BadRequest(format!("Attestation rejected: {other}")),
+        })?;
+
+    Ok(Json(VerifyAttestationResponse {
+        verified: true,
+        source_domain: parsed.source_domain,
+        destination_domain: parsed.destination_domain,
+        nonce: parsed.nonce,
+    }))
 }
 
 #[cfg(test)]
