@@ -1,6 +1,6 @@
 use axum_test::TestServer;
 use serde_json::json;
-use wow_engine::api::create_router;
+use wow_engine::api::{create_router, create_router_with_cache};
 
 #[tokio::test]
 async fn test_health_endpoint() {
@@ -213,4 +213,120 @@ async fn test_anchor_quote_invalid_amount() {
 
     let err_msg = response.text();
     assert!(err_msg.contains("Sell amount must be greater than zero"));
+}
+
+#[tokio::test]
+async fn test_anchor_quote_endpoint_success() {
+    // Sep38Client is stateless (no DB dependency), so this success path
+    // runs unconditionally, unlike the deposit/withdraw success tests below.
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    let payload = json!({
+        "anchor_domain": "test.com",
+        "sell_asset": "USDC",
+        "buy_asset": "NGN",
+        "sell_amount": 100.0
+    });
+
+    let response = server.post("/api/v1/anchor/quote").json(&payload).await;
+    response.assert_status_ok();
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["sell_asset"], "USDC");
+    assert_eq!(body["buy_asset"], "NGN");
+    assert_eq!(body["price"], "1450.0000000");
+    assert!(body["id"].as_str().unwrap().starts_with("q_sep38_"));
+}
+
+/// Success-path tests for the anchor deposit/withdraw endpoints. These
+/// require a live Postgres instance to back the `TrackerStore` (see
+/// `tests/transaction_atomicity_tests.rs` for the same convention) and are
+/// skipped by default since CI's `cargo test` doesn't pass
+/// `--include-ignored`.
+mod anchor_deposit_withdraw_success {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use wow_engine::anchor::tracker::TrackerStore;
+    use wow_engine::cache_sync::ClusterCache;
+    use wow_engine::config::AppConfig;
+    use wow_engine::db::Database;
+
+    async fn app_with_tracker() -> Option<axum::Router> {
+        let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:postgres@localhost/wow_engine_test".to_string()
+        });
+
+        let db = match Database::new(&database_url).await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Skipping test: {}", e);
+                return None;
+            }
+        };
+        db.run_migrations().await.ok();
+
+        let tracker = Arc::new(TrackerStore::new(db.clone()));
+
+        Some(create_router_with_cache(
+            Some(db),
+            None,
+            Some(tracker),
+            Duration::from_secs(30),
+            ClusterCache::local_only(),
+            Arc::new(AppConfig::default()),
+        ))
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_deposit_endpoint_success() {
+        let Some(app) = app_with_tracker().await else {
+            return;
+        };
+        let server = TestServer::new(app).unwrap();
+
+        let payload = json!({
+            "anchor_domain": "test.com",
+            "asset_code": "USDC",
+            "account": "GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK"
+        });
+
+        let response = server.post("/api/v1/anchor/deposit").json(&payload).await;
+        response.assert_status_ok();
+
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["type"], "interactive_customer_info_needed");
+        assert!(body["url"]
+            .as_str()
+            .unwrap()
+            .contains("/sep24/interactive/deposit"));
+        assert!(body["id"].as_str().unwrap().starts_with("tx_sep24_"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_withdraw_endpoint_success() {
+        let Some(app) = app_with_tracker().await else {
+            return;
+        };
+        let server = TestServer::new(app).unwrap();
+
+        let payload = json!({
+            "anchor_domain": "test.com",
+            "asset_code": "USDC",
+            "account": "GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK"
+        });
+
+        let response = server.post("/api/v1/anchor/withdraw").json(&payload).await;
+        response.assert_status_ok();
+
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["type"], "interactive_customer_info_needed");
+        assert!(body["url"]
+            .as_str()
+            .unwrap()
+            .contains("/sep24/interactive/withdraw"));
+    }
 }

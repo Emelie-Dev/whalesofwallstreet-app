@@ -99,3 +99,104 @@ impl TrackerStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn setup_store() -> Option<TrackerStore> {
+        let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:postgres@localhost/wow_engine_test".to_string()
+        });
+
+        match crate::db::Database::new(&database_url).await {
+            Ok(db) => {
+                db.run_migrations().await.ok();
+                Some(TrackerStore::new(db))
+            }
+            Err(e) => {
+                eprintln!("Skipping test: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Requires a live Postgres instance; skipped by default since CI's
+    /// `cargo test` doesn't pass `--include-ignored` (see
+    /// `tests/transaction_atomicity_tests.rs` for the same convention).
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_and_get_transaction_round_trips() {
+        let Some(store) = setup_store().await else {
+            return;
+        };
+
+        let tx = Transaction {
+            id: format!("tx_test_{}", super::super::generate_uuid()),
+            status: "pending_user_transfer_start".to_string(),
+            asset_code: "USDC".to_string(),
+            account: "GTESTACCOUNT".to_string(),
+            amount_in: Some("100.0".to_string()),
+            amount_out: None,
+        };
+
+        store.insert_transaction(tx.clone()).await.unwrap();
+
+        let fetched = store
+            .get_transaction(&tx.id)
+            .await
+            .unwrap()
+            .expect("transaction should exist after insert");
+
+        assert_eq!(fetched.id, tx.id);
+        assert_eq!(fetched.status, tx.status);
+        assert_eq!(fetched.asset_code, tx.asset_code);
+        assert_eq!(fetched.account, tx.account);
+        assert_eq!(fetched.amount_in, tx.amount_in);
+        assert_eq!(fetched.amount_out, tx.amount_out);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_insert_transaction_upserts_on_conflict() {
+        let Some(store) = setup_store().await else {
+            return;
+        };
+
+        let id = format!("tx_test_{}", super::super::generate_uuid());
+        let initial = Transaction {
+            id: id.clone(),
+            status: "pending_user_transfer_start".to_string(),
+            asset_code: "USDC".to_string(),
+            account: "GTESTACCOUNT".to_string(),
+            amount_in: None,
+            amount_out: None,
+        };
+        store.insert_transaction(initial).await.unwrap();
+
+        let updated = Transaction {
+            id: id.clone(),
+            status: "completed".to_string(),
+            asset_code: "USDC".to_string(),
+            account: "GTESTACCOUNT".to_string(),
+            amount_in: Some("100.0".to_string()),
+            amount_out: Some("99.5".to_string()),
+        };
+        store.insert_transaction(updated).await.unwrap();
+
+        let fetched = store.get_transaction(&id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, "completed");
+        assert_eq!(fetched.amount_out, Some("99.5".to_string()));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_get_transaction_returns_none_when_not_found() {
+        let Some(store) = setup_store().await else {
+            return;
+        };
+
+        let result = store.get_transaction("tx_does_not_exist").await.unwrap();
+        assert!(result.is_none());
+    }
+}

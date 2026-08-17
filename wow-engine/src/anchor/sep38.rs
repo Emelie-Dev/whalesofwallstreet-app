@@ -74,3 +74,69 @@ impl Sep38Client {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_quote_ngn_branch() {
+        let client = Sep38Client::new();
+        let quote = client
+            .generate_quote("test.com", "USDC", "NGN", 100.0, 15)
+            .unwrap();
+
+        assert_eq!(quote.price, "1450.0000000");
+        assert_eq!(quote.buy_amount, "145000.0000000");
+        assert_eq!(quote.sell_asset, "USDC");
+        assert_eq!(quote.buy_asset, "NGN");
+        assert!(quote.id.starts_with("q_sep38_"));
+    }
+
+    #[test]
+    fn test_generate_quote_eur_branch() {
+        let client = Sep38Client::new();
+        let quote = client
+            .generate_quote("test.com", "USDC", "EURT", 100.0, 15)
+            .unwrap();
+
+        assert_eq!(quote.price, "0.9200000");
+        assert_eq!(quote.buy_amount, "92.0000000");
+    }
+
+    #[test]
+    fn test_generate_quote_default_branch_is_one_to_one() {
+        let client = Sep38Client::new();
+        let quote = client
+            .generate_quote("test.com", "USDC", "USDC", 100.0, 15)
+            .unwrap();
+
+        assert_eq!(quote.price, "1.0000000");
+        assert_eq!(quote.buy_amount, "100.0000000");
+        assert_eq!(quote.sell_amount, "100.0000000");
+    }
+
+    #[tokio::test]
+    async fn test_get_indicative_quote_uses_longer_expiry_than_firm_quote() {
+        let client = Sep38Client::new();
+
+        let indicative = client
+            .get_indicative_quote("test.com", "USDC", "NGN", 50.0)
+            .await
+            .unwrap();
+        let firm = client
+            .get_firm_quote("test.com", "USDC", "NGN", 50.0)
+            .await
+            .unwrap();
+
+        let indicative_expiry = chrono::DateTime::parse_from_rfc3339(&indicative.expires_at)
+            .unwrap()
+            .timestamp();
+        let firm_expiry = chrono::DateTime::parse_from_rfc3339(&firm.expires_at)
+            .unwrap()
+            .timestamp();
+
+        // Indicative quotes (15 min) must expire later than firm quotes (5 min).
+        assert!(indicative_expiry > firm_expiry);
+    }
+}

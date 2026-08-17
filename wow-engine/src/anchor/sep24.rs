@@ -64,15 +64,110 @@ impl Sep24Client {
             })
             .await?;
 
-        let interactive_url = format!(
-            "https://{}/sep24/interactive/{}?asset_code={}&account={}&transaction_id={}&callback=postMessage",
-            anchor_domain, kind, asset_code, account, tx_id
-        );
+        let interactive_url =
+            build_interactive_url(kind, anchor_domain, asset_code, account, &tx_id);
 
         Ok(Sep24InteractiveResponse {
             r#type: "interactive_customer_info_needed".to_string(),
             url: interactive_url,
             id: tx_id,
         })
+    }
+}
+
+/// Builds the SEP-24 interactive redirect URL for a deposit/withdraw flow.
+///
+/// Split out from [`Sep24Client::initiate_flow`] so the URL format can be
+/// unit tested without needing a live [`super::tracker::TrackerStore`].
+fn build_interactive_url(
+    kind: &str,
+    anchor_domain: &str,
+    asset_code: &str,
+    account: &str,
+    tx_id: &str,
+) -> String {
+    format!(
+        "https://{}/sep24/interactive/{}?asset_code={}&account={}&transaction_id={}&callback=postMessage",
+        anchor_domain, kind, asset_code, account, tx_id
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_interactive_url_deposit_is_well_formed() {
+        let url = build_interactive_url(
+            "deposit",
+            "anchor.example.com",
+            "USDC",
+            "GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK",
+            "tx_sep24_abc123",
+        );
+
+        assert_eq!(
+            url,
+            "https://anchor.example.com/sep24/interactive/deposit?asset_code=USDC&account=GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK&transaction_id=tx_sep24_abc123&callback=postMessage"
+        );
+    }
+
+    #[test]
+    fn test_build_interactive_url_withdraw_uses_withdraw_path() {
+        let url = build_interactive_url(
+            "withdraw",
+            "anchor.example.com",
+            "XLM",
+            "GA5Z3IX5VQ3N6FB77T342A27RWRN7CKEZ63M3W7S5VJB3D77J6F2JAFK",
+            "tx_sep24_xyz789",
+        );
+
+        assert!(url.contains("/sep24/interactive/withdraw"));
+        assert!(url.contains("asset_code=XLM"));
+    }
+
+    /// Full round trip through `initiate_flow`, asserting the interactive
+    /// response's ID matches a transaction actually persisted in the
+    /// tracker. Requires a live Postgres instance (see
+    /// `tests/transaction_atomicity_tests.rs` for the same convention);
+    /// skipped by default since CI's `cargo test` doesn't pass
+    /// `--include-ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn test_initiate_deposit_inserts_matching_transaction_into_tracker() {
+        let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:postgres@localhost/wow_engine_test".to_string()
+        });
+
+        let db = match crate::db::Database::new(&database_url).await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Skipping test: {}", e);
+                return;
+            }
+        };
+        db.run_migrations().await.ok();
+
+        let tracker = std::sync::Arc::new(super::super::tracker::TrackerStore::new(db));
+        let client = Sep24Client::new(tracker.clone());
+
+        let response = client
+            .initiate_deposit("anchor.example.com", "USDC", "GTESTACCOUNT")
+            .await
+            .unwrap();
+
+        assert_eq!(response.r#type, "interactive_customer_info_needed");
+        assert!(response.url.contains("/sep24/interactive/deposit"));
+
+        let stored = tracker
+            .get_transaction(&response.id)
+            .await
+            .unwrap()
+            .expect("transaction should have been inserted into the tracker");
+
+        assert_eq!(stored.id, response.id);
+        assert_eq!(stored.asset_code, "USDC");
+        assert_eq!(stored.account, "GTESTACCOUNT");
+        assert_eq!(stored.status, "pending_user_transfer_start");
     }
 }
