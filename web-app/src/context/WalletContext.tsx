@@ -49,23 +49,45 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
       if (!res.ok) throw new Error("Deposit failed");
       return { amount, method };
     },
-    onSuccess: ({ amount, method }) => {
-      const tx: Transaction = {
-        id: `t_${Date.now()}`,
+    onMutate: ({ amount, method }) => {
+      const previousBalance = balance;
+      const previousTransactions = transactions;
+      const optimisticId = `pending_${Date.now()}`;
+
+      const optimisticTx: Transaction = {
+        id: optimisticId,
         type: "received",
         name: method,
         username: `@${method.toLowerCase().replace(" ", "")}`,
         avatar: "https://images.unsplash.com/photo-1621761191319-c6fb62004040?auto=format&fit=crop&q=80&w=200&h=200",
         amount,
-        note: `Deposited via ${method}`,
+        note: `Depositing via ${method}`,
         date: "Just now",
-        status: "completed",
+        status: "pending",
       };
-      setTransactions((prev) => [tx, ...prev]);
+
+      setTransactions((prev) => [optimisticTx, ...prev]);
       setBalance((prev) => prev + amount);
+
+      return { previousBalance, previousTransactions, optimisticId };
     },
-    onError: (error) => {
+    onSuccess: (_result, _variables, context) => {
+      // Flip the optimistic entry to completed in place instead of
+      // appending a second transaction for the same deposit.
+      setTransactions((prev) =>
+        prev.map((tx) =>
+          tx.id === context?.optimisticId ? { ...tx, status: "completed" } : tx
+        )
+      );
+    },
+    onError: (error, _variables, context) => {
       console.error(error);
+      // Roll back to the pre-mutation snapshot: the bridge transaction
+      // reverted, so the optimistic balance/transaction never happened.
+      if (context) {
+        setBalance(context.previousBalance);
+        setTransactions(context.previousTransactions);
+      }
     }
   });
 
@@ -87,23 +109,41 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
       if (!res.ok) throw new Error("Withdrawal failed");
       return { amount, bank };
     },
-    onSuccess: ({ amount, bank }) => {
-      const tx: Transaction = {
-        id: `t_${Date.now()}`,
+    onMutate: ({ amount, bank }) => {
+      const previousBalance = balance;
+      const previousTransactions = transactions;
+      const optimisticId = `pending_${Date.now()}`;
+
+      const optimisticTx: Transaction = {
+        id: optimisticId,
         type: "sent",
         name: bank,
         username: `@${bank.toLowerCase().replace(" ", "")}`,
         avatar: "https://images.unsplash.com/photo-1621761191319-c6fb62004040?auto=format&fit=crop&q=80&w=200&h=200",
         amount,
-        note: `Withdrew to ${bank}`,
+        note: `Withdrawing to ${bank}`,
         date: "Just now",
-        status: "completed",
+        status: "pending",
       };
-      setTransactions((prev) => [tx, ...prev]);
+
+      setTransactions((prev) => [optimisticTx, ...prev]);
       setBalance((prev) => prev - amount);
+
+      return { previousBalance, previousTransactions, optimisticId };
     },
-    onError: (error) => {
+    onSuccess: (_result, _variables, context) => {
+      setTransactions((prev) =>
+        prev.map((tx) =>
+          tx.id === context?.optimisticId ? { ...tx, status: "completed" } : tx
+        )
+      );
+    },
+    onError: (error, _variables, context) => {
       console.error(error);
+      if (context) {
+        setBalance(context.previousBalance);
+        setTransactions(context.previousTransactions);
+      }
     }
   });
 
