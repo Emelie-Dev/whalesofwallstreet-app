@@ -157,6 +157,13 @@ async fn main() -> anyhow::Result<()> {
         gas_oracle,
     ));
 
+    // Background task: prunes stale `historical_routes` entries so the
+    // archive table doesn't grow unbounded. No-op (and no-DB) deployments
+    // simply don't get a GC worker.
+    if let Some(db) = db.clone() {
+        tokio::spawn(wow_engine::db::gc::run_historical_routes_gc(db));
+    }
+
     // 4. Initialize API router with CORS and configuration.
     let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
     let cors_layer = build_cors_layer(&config);

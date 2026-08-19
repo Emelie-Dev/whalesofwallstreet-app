@@ -3,6 +3,7 @@ use sqlx::Transaction;
 use std::time::Duration;
 use tokio::time::timeout;
 
+pub mod gc;
 pub mod models;
 pub mod operations;
 pub mod service;
