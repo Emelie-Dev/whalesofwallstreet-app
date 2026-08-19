@@ -1,3 +1,4 @@
+pub mod arbitrage;
 pub mod dex;
 pub mod slippage;
 
@@ -361,6 +362,100 @@ impl RoutePlanner {
 
         Ok(final_routes)
     }
+
+    /// Builds a snapshot of the current liquidity graph — every DEX pair on
+    /// every chain, plus every bridge route between chains — as
+    /// [`arbitrage::ArbitrageEdge`]s, for negative-cycle (arbitrage)
+    /// detection.
+    ///
+    /// Uses [`arbitrage::ARBITRAGE_REFERENCE_UNITS`] rather than a real
+    /// user's trade size, so each edge approximates that pair's spot rate
+    /// instead of a rate skewed by one particular trade's own price impact.
+    /// Read-only against the same providers `find_best_route` uses, and
+    /// shares no mutable state with it.
+    pub async fn snapshot_arbitrage_edges(&self) -> Vec<arbitrage::ArbitrageEdge> {
+        let all_chains = [
+            Chain::Ethereum,
+            Chain::Arbitrum,
+            Chain::Solana,
+            Chain::Stellar,
+        ];
+        let all_assets = ["ETH", "USDC", "SOL", "XLM"];
+        let ref_units = arbitrage::ARBITRAGE_REFERENCE_UNITS;
+        let mut edges = Vec::new();
+
+        // Same-chain DEX swaps.
+        for &chain in &all_chains {
+            for &from in &all_assets {
+                for &to in &all_assets {
+                    if from == to {
+                        continue;
+                    }
+                    if let Ok(quote) = DexProvider::get_swap_quote(chain, from, to, ref_units) {
+                        edges.push(arbitrage::ArbitrageEdge {
+                            from: arbitrage::GraphNode::new(chain, from),
+                            to: arbitrage::GraphNode::new(chain, to),
+                            rate: quote.amount_out as f64 / ref_units as f64,
+                            label: format!("{} on {:?}: {} -> {}", quote.provider, chain, from, to),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Cross-chain bridges: CCTP (USDC only) and DeBridge (any asset,
+        // unchanged across the hop).
+        for &source_chain in &all_chains {
+            for &dest_chain in &all_chains {
+                if source_chain == dest_chain {
+                    continue;
+                }
+
+                if let Ok(quote) = self
+                    .cctp
+                    .get_quote(source_chain, dest_chain, "USDC", "USDC", ref_units)
+                    .await
+                {
+                    edges.push(arbitrage::ArbitrageEdge {
+                        from: arbitrage::GraphNode::new(source_chain, "USDC"),
+                        to: arbitrage::GraphNode::new(dest_chain, "USDC"),
+                        rate: quote.amount_out as f64 / ref_units as f64,
+                        label: format!(
+                            "{} bridge: USDC {:?} -> {:?}",
+                            quote.provider, source_chain, dest_chain
+                        ),
+                    });
+                }
+
+                for &asset in &all_assets {
+                    if let Ok(quote) = self
+                        .debridge
+                        .get_quote(source_chain, dest_chain, asset, asset, ref_units)
+                        .await
+                    {
+                        edges.push(arbitrage::ArbitrageEdge {
+                            from: arbitrage::GraphNode::new(source_chain, asset),
+                            to: arbitrage::GraphNode::new(dest_chain, asset),
+                            rate: quote.amount_out as f64 / ref_units as f64,
+                            label: format!(
+                                "{} bridge: {} {:?} -> {:?}",
+                                quote.provider, asset, source_chain, dest_chain
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        edges
+    }
+
+    /// Takes a snapshot of the live liquidity graph and checks it for an
+    /// arbitrage loop. See [`arbitrage::detect_arbitrage`].
+    pub async fn scan_for_arbitrage(&self) -> Option<arbitrage::ArbitrageDetected> {
+        let edges = self.snapshot_arbitrage_edges().await;
+        arbitrage::detect_arbitrage(&edges)
+    }
 }
 
 #[cfg(test)]
@@ -405,5 +500,38 @@ mod tests {
             "Should find a multi-hop route for ETH -> XLM"
         );
         println!("Best multi-hop route: {:?}", routes[0]);
+    }
+
+    #[tokio::test]
+    async fn test_scan_for_arbitrage_finds_none_in_synthetic_liquidity_graph() {
+        // Every DEX quote in this engine derives its reserves from the same
+        // shared mock price oracle, and every bridge charges a fee, so no
+        // loop through this mock liquidity graph can ever be profitable.
+        // This is a regression guard: if a future change to the mock
+        // pricing model (e.g. divergent price tables between providers)
+        // accidentally introduces a free-money loop, this test catches it
+        // rather than shipping it into `run_arbitrage_scanner`'s live scan.
+        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
+        let found = planner.scan_for_arbitrage().await;
+        assert!(
+            found.is_none(),
+            "synthetic liquidity graph should have no arbitrage, found: {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_arbitrage_edges_covers_dex_and_bridge_legs() {
+        let planner = RoutePlanner::new(Arc::new(AppConfig::default()));
+        let edges = planner.snapshot_arbitrage_edges().await;
+
+        assert!(!edges.is_empty(), "should produce a non-trivial graph");
+        assert!(
+            edges.iter().any(|e| e.label.contains("bridge")),
+            "should include at least one cross-chain bridge edge"
+        );
+        assert!(
+            edges.iter().any(|e| !e.label.contains("bridge")),
+            "should include at least one same-chain DEX edge"
+        );
     }
 }

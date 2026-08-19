@@ -164,6 +164,16 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(wow_engine::db::gc::run_historical_routes_gc(db));
     }
 
+    // Background task: periodically scans the liquidity graph for
+    // arbitrage (negative-weight cycle) opportunities. Entirely read-only
+    // and isolated from the request-serving path, so it never adds latency
+    // to a live quote.
+    let arbitrage_planner =
+        std::sync::Arc::new(wow_engine::router::RoutePlanner::new(config.clone()));
+    tokio::spawn(wow_engine::router::arbitrage::run_arbitrage_scanner(
+        arbitrage_planner,
+    ));
+
     // 4. Initialize API router with CORS and configuration.
     let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
     let cors_layer = build_cors_layer(&config);
