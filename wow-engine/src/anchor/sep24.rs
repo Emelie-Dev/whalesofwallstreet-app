@@ -6,6 +6,7 @@ pub struct Sep24Client {
     #[allow(dead_code)]
     client: ClientWithMiddleware,
     tracker: Arc<super::tracker::TrackerStore>,
+    sep10: super::sep10::Sep10Client,
 }
 
 impl Sep24Client {
@@ -14,6 +15,7 @@ impl Sep24Client {
             client: crate::http_client::build_resilient_client()
                 .expect("Failed to build resilient HTTP client"),
             tracker,
+            sep10: super::sep10::Sep10Client::new(),
         }
     }
 
@@ -53,6 +55,10 @@ impl Sep24Client {
     ) -> Result<Sep24InteractiveResponse, anyhow::Error> {
         let tx_id = format!("tx_sep24_{}", super::generate_uuid());
 
+        // 1. Authenticate via SEP-10
+        let jwt = self.sep10.authenticate(anchor_domain, account).await?;
+
+        // 2. Insert into tracker
         self.tracker
             .insert_transaction(super::tracker::Transaction {
                 id: tx_id.clone(),
@@ -64,13 +70,31 @@ impl Sep24Client {
             })
             .await?;
 
-        let interactive_url =
-            build_interactive_url(kind, anchor_domain, asset_code, account, &tx_id);
+        // 3. Make POST request to interactive endpoint
+        let endpoint = format!("https://{}/sep24/transactions/{}/interactive", anchor_domain, kind);
+        let resp = self.client.post(&endpoint)
+            .bearer_auth(jwt)
+            .json(&serde_json::json!({
+                "asset_code": asset_code,
+                "account": account,
+            }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!("Anchor rejected interactive flow: {} - {}", status, body));
+        }
+
+        let parsed: serde_json::Value = resp.json().await?;
+        let interactive_url = parsed["url"].as_str().unwrap_or("").to_string();
+        let anchor_tx_id = parsed["id"].as_str().unwrap_or(&tx_id).to_string();
 
         Ok(Sep24InteractiveResponse {
             r#type: "interactive_customer_info_needed".to_string(),
             url: interactive_url,
-            id: tx_id,
+            id: anchor_tx_id,
         })
     }
 }
