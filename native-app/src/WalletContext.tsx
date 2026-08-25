@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { currentUser as initialUser, transactions as initialTransactions, Transaction } from "./data/mockData";
 
 type WalletContextType = {
@@ -10,6 +10,7 @@ type WalletContextType = {
   withdraw: (amount: number, bank: string) => void;
   isDepositing: boolean;
   isWithdrawing: boolean;
+  isOffline: boolean;
 };
 
 const WalletContext = createContext<WalletContextType | undefined>(undefined);
@@ -17,8 +18,23 @@ const WalletContext = createContext<WalletContextType | undefined>(undefined);
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:8080";
 
 export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
-  const [balance, setBalance] = useState(initialUser.balance);
-  const [transactions, setTransactions] = useState<Transaction[]>(initialTransactions);
+  const queryClient = useQueryClient();
+
+  const portfolioQuery = useQuery({
+    queryKey: ["portfolio"],
+    queryFn: async () => {
+      // Simulate network request
+      await new Promise(resolve => setTimeout(resolve, 800));
+      return {
+        balance: initialUser.balance,
+        transactions: initialTransactions,
+      };
+    },
+  });
+
+  const balance = portfolioQuery.data?.balance ?? 0;
+  const transactions = portfolioQuery.data?.transactions ?? [];
+  const isOffline = portfolioQuery.fetchStatus === "paused" || portfolioQuery.isError;
 
   const addTransaction = (newTx: Omit<Transaction, "id" | "date" | "status">) => {
     const tx: Transaction = {
@@ -27,12 +43,15 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
       date: "Just now",
       status: "completed",
     };
-    setTransactions((prev) => [tx, ...prev]);
-    if (newTx.type === "sent") {
-      setBalance((prev) => prev - newTx.amount);
-    } else {
-      setBalance((prev) => prev + newTx.amount);
-    }
+    queryClient.setQueryData(["portfolio"], (old: any) => {
+      if (!old) return old;
+      const amountChange = newTx.type === "sent" ? -newTx.amount : newTx.amount;
+      return {
+        ...old,
+        balance: old.balance + amountChange,
+        transactions: [tx, ...old.transactions],
+      };
+    });
   };
 
   const depositMutation = useMutation({
@@ -61,8 +80,14 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
         date: "Just now",
         status: "completed",
       };
-      setTransactions((prev) => [tx, ...prev]);
-      setBalance((prev) => prev + amount);
+      queryClient.setQueryData(["portfolio"], (old: any) => {
+        if (!old) return old;
+        return {
+          ...old,
+          balance: old.balance + amount,
+          transactions: [tx, ...old.transactions],
+        };
+      });
     },
     onError: (error) => {
       console.error(error);
@@ -99,8 +124,14 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
         date: "Just now",
         status: "completed",
       };
-      setTransactions((prev) => [tx, ...prev]);
-      setBalance((prev) => prev - amount);
+      queryClient.setQueryData(["portfolio"], (old: any) => {
+        if (!old) return old;
+        return {
+          ...old,
+          balance: old.balance - amount,
+          transactions: [tx, ...old.transactions],
+        };
+      });
     },
     onError: (error) => {
       console.error(error);
@@ -115,7 +146,8 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     <WalletContext.Provider value={{ 
       balance, transactions, addTransaction, deposit, withdraw, 
       isDepositing: depositMutation.isPending, 
-      isWithdrawing: withdrawMutation.isPending 
+      isWithdrawing: withdrawMutation.isPending,
+      isOffline
     }}>
       {children}
     </WalletContext.Provider>

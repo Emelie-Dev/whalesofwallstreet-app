@@ -15,7 +15,7 @@ import { shadows } from "../theme";
 
 const HomeScreen = ({ navigation }: any) => {
   const { c } = useTheme();
-  const { balance, transactions } = useWallet();
+  const { balance, transactions, isOffline } = useWallet();
   const [refreshing, setRefreshing] = useState(false);
 
   const onRefresh = () => {
@@ -55,7 +55,13 @@ const HomeScreen = ({ navigation }: any) => {
             </View>
           </View>
 
-          <View>
+          <View style={styles.headerRight}>
+            {isOffline && (
+              <View style={[styles.offlineBadge, { backgroundColor: c.destructive + "20", borderColor: c.destructive + "50" }]}>
+                <Ionicons name="cloud-offline" size={12} color={c.destructive} />
+                <Text style={[styles.offlineText, { color: c.destructive }]}>Offline</Text>
+              </View>
+            )}
             <TouchableOpacity
               onPress={() => navigation.navigate("Notifications")}
               activeOpacity={0.7}
@@ -124,6 +130,9 @@ const styles = StyleSheet.create({
   sectionTitle: { fontSize: 11, fontWeight: "600", letterSpacing: 1.5 },
   seeAll: { fontSize: 12, fontWeight: "600" },
   txCard: { borderRadius: 24, padding: 6, borderWidth: 1 },
+  headerRight: { flexDirection: "row", alignItems: "center", gap: 10 },
+  offlineBadge: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12, borderWidth: 1 },
+  offlineText: { fontSize: 10, fontWeight: "600" },
 });
 
 export default HomeScreen;
