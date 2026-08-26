@@ -25,6 +25,24 @@ Rust-based cross-chain routing and fiat orchestration engine.
 
 ---
 
+## Configuration
+
+Full list of environment variables lives in `wow-engine/.env.example`. The
+gas oracle's provider keys are called out separately here since running
+without them is easy to miss in production:
+
+| Variable            | Required | Description                                                                                                     |
+|----------------------|----------|-------------------------------------------------------------------------------------------------------------------|
+| `ETHERSCAN_API_KEY`  | Recommended | Authenticates outbound Etherscan gas-tracker calls. Without it, requests are sent unauthenticated and are subject to Etherscan's strict per-IP rate limits — under real load this pushes gas pricing onto static fallback values. Get a free key at https://etherscan.io/myapikey. |
+| `ARBISCAN_API_KEY`   | Recommended | Same as above, for Arbiscan gas-tracker calls. Get a free key at https://arbiscan.io/myapikey. |
+
+When a gas-fee lookup falls back to static pricing, the engine logs a
+`reason` of `missing_api_key` (no key configured) or `provider_outage` (a
+key is configured but the provider call still failed), and increments
+`GasOracle::fallback_count()` — watch both for sustained degradation.
+
+---
+
 ## Runtime
 
 - **Language**: Rust
