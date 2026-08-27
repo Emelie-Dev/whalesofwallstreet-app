@@ -43,6 +43,9 @@ pub struct AppConfig {
     /// replay protection survives restarts and redeploys.
     #[serde(default = "default_cctp_nonce_store_path")]
     pub cctp_nonce_store_path: String,
+    /// Stellar Horizon endpoint used to read wallet balances and payments.
+    #[serde(default = "default_stellar_horizon_url")]
+    pub stellar_horizon_url: String,
 
     // ── Gas Oracle ──────────────────────────────────────────────────
     /// API key for Etherscan gas-tracker requests. When set, appended as
@@ -99,6 +102,10 @@ fn default_cctp_nonce_store_path() -> String {
     "data/cctp_consumed_nonces.log".to_string()
 }
 
+fn default_stellar_horizon_url() -> String {
+    "https://horizon-testnet.stellar.org".to_string()
+}
+
 fn default_allowed_anchor_domains() -> HashSet<String> {
     [
         "testanchor.stellar.org",
@@ -122,6 +129,7 @@ impl Default for AppConfig {
             eth_rpc_url: default_eth_rpc_url(),
             cctp_message_transmitter: default_cctp_message_transmitter(),
             cctp_nonce_store_path: default_cctp_nonce_store_path(),
+            stellar_horizon_url: default_stellar_horizon_url(),
             etherscan_api_key: None,
             arbiscan_api_key: None,
             allowed_anchor_domains: default_allowed_anchor_domains(),

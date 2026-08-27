@@ -1,10 +1,6 @@
 import React, { createContext, useContext } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  currentUser as initialUser,
-  transactions as initialTransactions,
-  Transaction,
-} from "./data/mockData";
+import { currentUser as initialUser, Transaction } from "./data/mockData";
 
 type WalletPortfolio = {
   balance: number;
@@ -30,10 +26,13 @@ const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:8080";
 const portfolioQueryKey = ["wallet-portfolio"] as const;
 
-const loadWalletPortfolio = async (): Promise<WalletPortfolio> => ({
-  balance: initialUser.balance,
-  transactions: initialTransactions,
-});
+const loadWalletPortfolio = async (): Promise<WalletPortfolio> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/wallet/portfolio?account=${encodeURIComponent(initialUser.stellarAddress)}`,
+  );
+  if (!response.ok) throw new Error("Portfolio lookup failed");
+  return response.json() as Promise<WalletPortfolio>;
+};
 
 export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
   const queryClient = useQueryClient();

@@ -56,7 +56,11 @@ pub const TIMESTAMP_HEADER: &str = "x-timestamp";
 ///
 /// Kept intentionally tiny: only unauthenticated health checks and the public
 /// quoting pathfinder belong here. Everything else is protected by default.
-pub const PUBLIC_PATHS: &[&str] = &["/api/v1/health", "/api/v1/quote"];
+pub const PUBLIC_PATHS: &[&str] = &[
+    "/api/v1/health",
+    "/api/v1/quote",
+    "/api/v1/wallet/portfolio",
+];
 
 /// Maximum request body we are willing to buffer for hashing (1 MiB).
 ///
