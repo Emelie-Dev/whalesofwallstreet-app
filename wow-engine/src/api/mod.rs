@@ -270,12 +270,18 @@ async fn portfolio_handler(
         .get(&account_url)
         .send()
         .await
-        .map_err(|error| AppError::ServiceUnavailable(format!("Stellar account lookup failed: {error}")))?
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Stellar account lookup failed: {error}"))
+        })?
         .error_for_status()
-        .map_err(|error| AppError::ServiceUnavailable(format!("Stellar account lookup failed: {error}")))?
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Stellar account lookup failed: {error}"))
+        })?
         .json::<HorizonAccount>()
         .await
-        .map_err(|error| AppError::ServiceUnavailable(format!("Invalid Stellar account response: {error}")))?;
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Invalid Stellar account response: {error}"))
+        })?;
 
     let balance = account
         .balances
@@ -294,12 +300,18 @@ async fn portfolio_handler(
         .get(&payments_url)
         .send()
         .await
-        .map_err(|error| AppError::ServiceUnavailable(format!("Stellar payments lookup failed: {error}")))?
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Stellar payments lookup failed: {error}"))
+        })?
         .error_for_status()
-        .map_err(|error| AppError::ServiceUnavailable(format!("Stellar payments lookup failed: {error}")))?
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Stellar payments lookup failed: {error}"))
+        })?
         .json::<HorizonPayments>()
         .await
-        .map_err(|error| AppError::ServiceUnavailable(format!("Invalid Stellar payments response: {error}")))?;
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Invalid Stellar payments response: {error}"))
+        })?;
 
     let transactions = payments
         ._embedded
