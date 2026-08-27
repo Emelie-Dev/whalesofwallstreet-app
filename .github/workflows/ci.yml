@@ -144,7 +144,7 @@ jobs:
           tool: "cargo"
           output-file-path: wow-engine/benchmark_result.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          comment-always: true
+          comment-always: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
           fail-on-alert: true
           alert-threshold: "105%"
           external-data-json-path: ./cache/benchmark-data.json
