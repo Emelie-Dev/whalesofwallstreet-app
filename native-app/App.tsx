@@ -1,20 +1,9 @@
 import React from "react";
-import { QueryClient } from "@tanstack/react-query";
-import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
-import { createAsyncStoragePersister } from "@tanstack/query-async-storage-persister";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { QueryClient } from "@tanstack/react-query";
+import { createAsyncStoragePersister } from "@tanstack/query-async-storage-persister";
+import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      gcTime: 1000 * 60 * 60 * 24, // 24 hours
-    },
-  },
-});
-
-const asyncStoragePersister = createAsyncStoragePersister({
-  storage: AsyncStorage,
-});
 import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
@@ -34,6 +23,19 @@ import SaveScreen from "./src/screens/SaveScreen";
 import InvestScreen from "./src/screens/InvestScreen";
 import TransactionDetailScreen from "./src/screens/TransactionDetailScreen";
 import NotificationsScreen from "./src/screens/NotificationsScreen";
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      gcTime: 1000 * 60 * 60 * 24,
+    },
+  },
+});
+
+const asyncStoragePersister = createAsyncStoragePersister({
+  storage: AsyncStorage,
+  key: "wow-query-cache",
+});
 
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
@@ -110,8 +112,9 @@ export default function App() {
       client={queryClient}
       persistOptions={{
         persister: asyncStoragePersister,
+        maxAge: 1000 * 60 * 60 * 24,
         dehydrateOptions: {
-          shouldDehydrateQuery: (query) => !query.queryKey.includes("sensitive"),
+          shouldDehydrateQuery: (query) => query.queryKey[0] === "wallet-portfolio",
         },
       }}
     >
