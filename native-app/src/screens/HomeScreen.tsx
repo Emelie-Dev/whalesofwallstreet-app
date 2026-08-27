@@ -15,14 +15,19 @@ import { shadows } from "../theme";
 
 const HomeScreen = ({ navigation }: any) => {
   const { c } = useTheme();
-  const { balance, transactions } = useWallet();
+  const {
+    balance,
+    transactions,
+    isOffline,
+    isPortfolioUnavailable,
+    refreshPortfolio,
+  } = useWallet();
   const [refreshing, setRefreshing] = useState(false);
 
-  const onRefresh = () => {
+  const onRefresh = async () => {
     setRefreshing(true);
-    setTimeout(() => {
-      setRefreshing(false);
-    }, 1500);
+    await refreshPortfolio();
+    setRefreshing(false);
   };
 
   const hour = new Date().getHours();
@@ -55,7 +60,13 @@ const HomeScreen = ({ navigation }: any) => {
             </View>
           </View>
 
-          <View>
+          <View style={styles.headerRight}>
+            {isOffline && (
+              <View style={[styles.offlineBadge, { backgroundColor: c.warning + "20", borderColor: c.warning + "50" }]}>
+                <Ionicons name="cloud-offline-outline" size={12} color={c.warning} />
+                <Text style={[styles.offlineText, { color: c.warning }]}>Offline</Text>
+              </View>
+            )}
             <TouchableOpacity
               onPress={() => navigation.navigate("Notifications")}
               activeOpacity={0.7}
@@ -67,39 +78,45 @@ const HomeScreen = ({ navigation }: any) => {
           </View>
         </View>
 
-        {/* Balance */}
-        <View style={styles.section}>
-          <BalanceCard balance={balance} />
-        </View>
-
-        {/* Actions */}
-        <View style={styles.section}>
-          <ActionButtons navigation={navigation} />
-        </View>
-
-        {/* Quick Contacts */}
-        <View style={styles.section}>
-          <QuickContacts navigation={navigation} />
-        </View>
-
-        {/* Transactions */}
-        <View style={styles.section}>
-          <View style={styles.sectionHeader}>
-            <Text style={[styles.sectionTitle, { color: c.mutedForeground }]}>RECENT TRANSACTIONS</Text>
-            <TouchableOpacity onPress={() => navigation.navigate("Activity")}>
-              <Text style={[styles.seeAll, { color: c.primary }]}>See all</Text>
-            </TouchableOpacity>
+        {isPortfolioUnavailable ? (
+          <View style={[styles.emptyState, { backgroundColor: c.card, borderColor: c.border }, shadows.card]}>
+            <Ionicons name="cloud-offline-outline" size={30} color={c.mutedForeground} />
+            <Text style={[styles.emptyStateTitle, { color: c.foreground }]}>Wallet data unavailable</Text>
+            <Text style={[styles.emptyStateText, { color: c.mutedForeground }]}>Connect to the internet and pull to refresh your wallet.</Text>
           </View>
-          <View style={[styles.txCard, { backgroundColor: c.card, borderColor: c.border + "50" }, shadows.card]}>
-            {transactions.slice(0, 5).map((tx) => (
-              <TransactionItem
-                key={tx.id}
-                transaction={tx}
-                onPress={() => navigation.navigate("TransactionDetail", { id: tx.id })}
-              />
-            ))}
-          </View>
-        </View>
+        ) : (
+          <>
+            <View style={styles.section}>
+              <BalanceCard balance={balance} />
+            </View>
+
+            <View style={styles.section}>
+              <ActionButtons navigation={navigation} />
+            </View>
+
+            <View style={styles.section}>
+              <QuickContacts navigation={navigation} />
+            </View>
+
+            <View style={styles.section}>
+              <View style={styles.sectionHeader}>
+                <Text style={[styles.sectionTitle, { color: c.mutedForeground }]}>RECENT TRANSACTIONS</Text>
+                <TouchableOpacity onPress={() => navigation.navigate("Activity")}>
+                  <Text style={[styles.seeAll, { color: c.primary }]}>See all</Text>
+                </TouchableOpacity>
+              </View>
+              <View style={[styles.txCard, { backgroundColor: c.card, borderColor: c.border + "50" }, shadows.card]}>
+                {transactions.slice(0, 5).map((tx) => (
+                  <TransactionItem
+                    key={tx.id}
+                    transaction={tx}
+                    onPress={() => navigation.navigate("TransactionDetail", { id: tx.id })}
+                  />
+                ))}
+              </View>
+            </View>
+          </>
+        )}
       </ScrollView>
     </SafeAreaView>
   );
@@ -124,6 +141,12 @@ const styles = StyleSheet.create({
   sectionTitle: { fontSize: 11, fontWeight: "600", letterSpacing: 1.5 },
   seeAll: { fontSize: 12, fontWeight: "600" },
   txCard: { borderRadius: 24, padding: 6, borderWidth: 1 },
+  headerRight: { flexDirection: "row", alignItems: "center", gap: 10 },
+  offlineBadge: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12, borderWidth: 1 },
+  offlineText: { fontSize: 10, fontWeight: "600" },
+  emptyState: { alignItems: "center", gap: 10, marginTop: 64, padding: 28, borderRadius: 24, borderWidth: 1 },
+  emptyStateTitle: { fontSize: 16, fontWeight: "700" },
+  emptyStateText: { fontSize: 13, lineHeight: 19, textAlign: "center" },
 });
 
 export default HomeScreen;
