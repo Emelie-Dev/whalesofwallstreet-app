@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+use wow_engine::api::cors::build_cors_layer;
 
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -27,23 +27,6 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("Shutdown signal received, starting graceful shutdown");
-}
-
-fn build_cors_layer(config: &wow_engine::config::AppConfig) -> CorsLayer {
-    if config.allowed_cors_origins.is_empty() {
-        return CorsLayer::permissive();
-    }
-
-    let origins: Vec<_> = config
-        .allowed_cors_origins
-        .iter()
-        .filter_map(|o| o.parse().ok())
-        .collect();
-
-    CorsLayer::new()
-        .allow_origin(origins)
-        .allow_methods(Any)
-        .allow_headers(Any)
 }
 
 #[tokio::main]
@@ -186,7 +169,6 @@ async fn main() -> anyhow::Result<()> {
         config.clone(),
     )
     .layer(cors_layer)
-    .layer(CorsLayer::permissive())
     .layer(TraceLayer::new_for_http());
 
     // 5. Bind TCP listener on configured port
@@ -205,9 +187,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("     - POST /api/v1/anchor/quote        (SEP-38 Anchor Quotes)");
     tracing::info!("     - POST /api/v1/admin/invalidate-cache (Cluster Cache Invalidation)");
 
-    // 6. Serve incoming TCP requests through Axum pipeline
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // 6. Serve incoming TCP requests through Axum pipeline. Connect-info is
+    //    threaded through so rate limiting can key on the real peer IP.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
