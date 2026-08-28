@@ -137,6 +137,7 @@ pub fn create_router(db: Option<Database>, verifier: Option<SignatureVerifier>) 
         Duration::from_secs(30),
         ClusterCache::local_only(),
         Arc::new(AppConfig::default()),
+        Arc::new(Sep38Client::new()),
     )
 }
 
@@ -147,6 +148,7 @@ pub fn create_router_with_cache(
     request_timeout: Duration,
     cache: ClusterCache,
     config: Arc<AppConfig>,
+    sep38_client: Arc<Sep38Client>,
 ) -> Router {
     let router = Router::new()
         .route("/api/v1/health", get(health_handler))
@@ -170,7 +172,8 @@ pub fn create_router_with_cache(
         .layer(Extension(db))
         .layer(Extension(cache))
         .layer(Extension(config))
-        .layer(Extension(tracker));
+        .layer(Extension(tracker))
+        .layer(Extension(sep38_client));
 
     // The signature layer is added last so it runs *first* — verification
     // happens before any handler (or its body extractor) sees the request.
@@ -313,8 +316,9 @@ async fn withdraw_handler(
     Ok(Json(tx))
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(skip(client), err)]
 async fn anchor_quote_handler(
+    Extension(client): Extension<Arc<Sep38Client>>,
     Json(payload): Json<AnchorQuoteRequest>,
 ) -> Result<Json<Sep38Quote>, AppError> {
     if let Err(err) = validate_asset_code(&payload.sell_asset) {
@@ -334,7 +338,6 @@ async fn anchor_quote_handler(
         ));
     }
 
-    let client = Sep38Client::new();
     let quote = client
         .get_indicative_quote(
             &payload.anchor_domain,

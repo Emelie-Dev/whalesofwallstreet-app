@@ -177,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
     // 4. Initialize API router with CORS and configuration.
     let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
     let cors_layer = build_cors_layer(&config);
+    let sep38_client = std::sync::Arc::new(wow_engine::anchor::sep38::Sep38Client::new());
     let app = wow_engine::api::create_router_with_cache(
         db,
         verifier,
@@ -184,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
         request_timeout,
         cluster_cache,
         config.clone(),
+        sep38_client,
     )
     .layer(cors_layer)
     .layer(CorsLayer::permissive())
