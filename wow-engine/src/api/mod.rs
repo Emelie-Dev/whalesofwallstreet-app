@@ -200,6 +200,7 @@ pub fn create_router(db: Option<Database>, verifier: Option<SignatureVerifier>) 
         Duration::from_secs(30),
         ClusterCache::local_only(),
         Arc::new(AppConfig::default()),
+        Arc::new(Sep38Client::new()),
     )
 }
 
@@ -210,6 +211,7 @@ pub fn create_router_with_cache(
     request_timeout: Duration,
     cache: ClusterCache,
     config: Arc<AppConfig>,
+    sep38_client: Arc<Sep38Client>,
 ) -> Router {
     // Every route shares a global per-IP budget; `/api/v1/quote` additionally
     // gets its own, stricter budget since it runs a non-trivial pathfinding
@@ -255,6 +257,7 @@ pub fn create_router_with_cache(
         .layer(Extension(cache))
         .layer(Extension(config))
         .layer(Extension(tracker))
+        .layer(Extension(sep38_client))
         .layer(axum::middleware::from_fn_with_state(
             global_limiter,
             rate_limit::rate_limit_middleware,
@@ -489,8 +492,9 @@ async fn withdraw_handler(
     Ok(Json(tx))
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(skip(client), err)]
 async fn anchor_quote_handler(
+    Extension(client): Extension<Arc<Sep38Client>>,
     Json(payload): Json<AnchorQuoteRequest>,
 ) -> Result<Json<Sep38Quote>, AppError> {
     if let Err(err) = validate_asset_code(&payload.sell_asset) {
@@ -510,7 +514,6 @@ async fn anchor_quote_handler(
         ));
     }
 
-    let client = Sep38Client::new();
     let quote = client
         .get_indicative_quote(
             &payload.anchor_domain,
