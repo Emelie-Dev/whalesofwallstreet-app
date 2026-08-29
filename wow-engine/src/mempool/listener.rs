@@ -156,7 +156,7 @@ async fn run_single_connection(
 
     while let Some(msg) = read.next().await {
         match msg? {
-            Message::Text(text) => handle_message(&text, chain, registry, detector).await,
+            Message::Text(text) => handle_message(&text, chain, registry, detector),
             Message::Close(_) => break,
             // Ping/Pong are handled automatically by tokio-tungstenite;
             // Binary/Frame carry nothing this feed ever sends.
@@ -196,7 +196,7 @@ fn parse_subscribe_ack(text: &str) -> anyhow::Result<String> {
 /// frame, an unrelated notification shape, malformed JSON) is silently
 /// ignored: this is a best-effort monitor layered on top of routing, never
 /// a dependency it can fail.
-async fn handle_message(
+fn handle_message(
     text: &str,
     chain: Chain,
     registry: &Arc<PoolRiskRegistry>,
@@ -232,12 +232,10 @@ async fn handle_message(
                     pattern = ?alert.pattern,
                     "SandwichAlert: suspected front-run pattern detected in mempool"
                 );
-                registry
-                    .flag(
-                        alert.pool.clone(),
-                        format!("{:?} via tx {}", alert.pattern, decoded.hash),
-                    )
-                    .await;
+                registry.flag(
+                    alert.pool.clone(),
+                    format!("{:?} via tx {}", alert.pattern, decoded.hash),
+                );
             }
         }
     }
@@ -275,19 +273,19 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn handle_message_flags_a_pool_on_a_detected_frontrun() {
+    #[test]
+    fn handle_message_flags_a_pool_on_a_detected_frontrun() {
         let registry = Arc::new(PoolRiskRegistry::new());
         let mut detector = SandwichDetector::new();
 
         let victim = swap_notification("0xvictim", "0xalice", "0x4a817c800"); // 20 gwei
-        handle_message(&victim, Chain::Ethereum, &registry, &mut detector).await;
+        handle_message(&victim, Chain::Ethereum, &registry, &mut detector);
 
         let attacker = swap_notification("0xattack", "0xbot", "0x9502f9000"); // 40 gwei
-        handle_message(&attacker, Chain::Ethereum, &registry, &mut detector).await;
+        handle_message(&attacker, Chain::Ethereum, &registry, &mut detector);
 
         let pool = PoolKey::new(Chain::Ethereum, "ETH", "USDC");
-        assert!(registry.is_high_risk(&pool).await);
+        assert!(registry.is_high_risk(&pool));
     }
 
     #[test]
@@ -358,20 +356,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn handle_message_ignores_a_subscription_confirmation() {
+    #[test]
+    fn handle_message_ignores_a_subscription_confirmation() {
         let registry = Arc::new(PoolRiskRegistry::new());
         let mut detector = SandwichDetector::new();
         let confirmation = r#"{"jsonrpc":"2.0","id":1,"result":"0xsubscriptionid"}"#;
         // Must not panic on a message shape with no `params.result`.
-        handle_message(confirmation, Chain::Ethereum, &registry, &mut detector).await;
+        handle_message(confirmation, Chain::Ethereum, &registry, &mut detector);
     }
 
-    #[tokio::test]
-    async fn handle_message_ignores_malformed_json() {
+    #[test]
+    fn handle_message_ignores_malformed_json() {
         let registry = Arc::new(PoolRiskRegistry::new());
         let mut detector = SandwichDetector::new();
-        handle_message("not json at all", Chain::Ethereum, &registry, &mut detector).await;
+        handle_message("not json at all", Chain::Ethereum, &registry, &mut detector);
     }
 
     #[tokio::test]

@@ -215,15 +215,25 @@ impl RoutePlanner {
                             // Widen this leg's slippage tolerance when the
                             // mempool listener has this pool flagged as
                             // under a suspected front-run/sandwich attack —
-                            // see crate::mempool.
-                            let pool =
-                                PoolKey::new(state.node.chain, &state.node.asset, target_asset);
-                            let slippage_bps = if self.risk_registry.is_high_risk(&pool).await {
-                                quote
-                                    .slippage_bps
-                                    .saturating_add(HIGH_RISK_SLIPPAGE_PENALTY_BPS)
-                            } else {
+                            // see crate::mempool. This runs once per
+                            // candidate edge in the search, not once per
+                            // request, so the common case (no listener
+                            // running, or one that hasn't flagged
+                            // anything recently) is short-circuited via
+                            // `is_empty()` before paying for the PoolKey
+                            // allocation or a real cache lookup.
+                            let slippage_bps = if self.risk_registry.is_empty() {
                                 quote.slippage_bps
+                            } else {
+                                let pool =
+                                    PoolKey::new(state.node.chain, &state.node.asset, target_asset);
+                                if self.risk_registry.is_high_risk(&pool) {
+                                    quote
+                                        .slippage_bps
+                                        .saturating_add(HIGH_RISK_SLIPPAGE_PENALTY_BPS)
+                                } else {
+                                    quote.slippage_bps
+                                }
                             };
 
                             let best = best_seen.entry(next_node.clone()).or_insert(0);
@@ -583,12 +593,10 @@ mod tests {
             .unwrap();
         let baseline_slippage = baseline[0].slippage_bps;
 
-        registry
-            .flag(
-                PoolKey::new(Chain::Ethereum, "ETH", "USDC"),
-                "test".to_string(),
-            )
-            .await;
+        registry.flag(
+            PoolKey::new(Chain::Ethereum, "ETH", "USDC"),
+            "test".to_string(),
+        );
 
         let flagged = planner
             .find_best_route(Chain::Ethereum, Chain::Ethereum, "ETH", "USDC", 1, false)
