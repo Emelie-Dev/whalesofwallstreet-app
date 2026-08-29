@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
