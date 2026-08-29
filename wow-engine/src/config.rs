@@ -133,6 +133,27 @@ pub struct AppConfig {
     /// `MEMPOOL_WATCHED_CONTRACTS` env var.
     #[serde(default)]
     pub mempool_watched_contracts: Vec<String>,
+    /// Comma-separated list of `STELLAR_ACCOUNT=SECRET_KEY` pairs used to sign
+    /// SEP-10 challenges for the listed Stellar accounts.
+    ///
+    /// Example: `"GABCD...=SABCD...,GXYZZY...=SXYZZY..."`
+    ///
+    /// Only accounts with a configured secret can authenticate against anchors
+    /// via SEP-10; calls to [`Sep10Client::authenticate`] referencing any other
+    /// account are rejected with `BadRequest`. Keep empty for deployments that
+    /// never initiate SEP-10 flows.
+    #[serde(default)]
+    pub sep10_signing_keys: Vec<String>,
+    /// Maximum age, in seconds, that a SEP-10 challenge transaction's
+    /// `timeBounds.minTime` may predate the current wall clock before we
+    /// refuse to sign it. Defeats replay of recently-captured challenges.
+    #[serde(default = "default_sep10_challenge_max_age_secs")]
+    pub sep10_challenge_max_age_secs: i64,
+    /// Maximum future skew, in seconds, that a SEP-10 challenge's
+    /// `timeBounds.minTime` may be ahead of the current wall clock. Catches
+    /// accidental clock-skew between the anchor and this engine.
+    #[serde(default = "default_sep10_challenge_max_future_skew_secs")]
+    pub sep10_challenge_max_future_skew_secs: i64,
 }
 
 fn default_port() -> u16 {
@@ -186,6 +207,14 @@ fn default_allowed_anchor_domains() -> HashSet<String> {
     .collect()
 }
 
+fn default_sep10_challenge_max_age_secs() -> i64 {
+    300
+}
+
+fn default_sep10_challenge_max_future_skew_secs() -> i64 {
+    60
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -207,6 +236,9 @@ impl Default for AppConfig {
             trust_proxy_headers: false,
             mempool_wss_url: None,
             mempool_watched_contracts: Vec::new(),
+            sep10_signing_keys: Vec::new(),
+            sep10_challenge_max_age_secs: default_sep10_challenge_max_age_secs(),
+            sep10_challenge_max_future_skew_secs: default_sep10_challenge_max_future_skew_secs(),
         }
     }
 }

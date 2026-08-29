@@ -470,7 +470,13 @@ async fn deposit_handler(
         ))
     })?;
 
-    let client = Sep24Client::new(tracker);
+    let client = Sep24Client::new(
+        tracker,
+        &config.sep10_signing_keys,
+        config.sep10_challenge_max_age_secs,
+        config.sep10_challenge_max_future_skew_secs,
+    )
+    .map_err(|e| AppError::Internal(e))?;
     let tx = client
         .initiate_deposit(
             &payload.anchor_domain,
@@ -507,7 +513,13 @@ async fn withdraw_handler(
         ))
     })?;
 
-    let client = Sep24Client::new(tracker);
+    let client = Sep24Client::new(
+        tracker,
+        &config.sep10_signing_keys,
+        config.sep10_challenge_max_age_secs,
+        config.sep10_challenge_max_future_skew_secs,
+    )
+    .map_err(|e| AppError::Internal(e))?;
     let tx = client
         .initiate_withdrawal(
             &payload.anchor_domain,

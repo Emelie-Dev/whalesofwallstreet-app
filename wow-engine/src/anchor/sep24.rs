@@ -10,7 +10,26 @@ pub struct Sep24Client {
 }
 
 impl Sep24Client {
-    pub fn new(tracker: Arc<super::tracker::TrackerStore>) -> Self {
+    pub fn new(
+        tracker: Arc<super::tracker::TrackerStore>,
+        sep10_signing_keys: &[String],
+        challenge_max_age_secs: i64,
+        challenge_max_future_skew_secs: i64,
+    ) -> Result<Self, anyhow::Error> {
+        let sep10 = super::sep10::Sep10Client::from_config(
+            sep10_signing_keys,
+            challenge_max_age_secs,
+            challenge_max_future_skew_secs,
+        )?;
+        Ok(Self {
+            client: crate::http_client::build_resilient_client()
+                .expect("Failed to build resilient HTTP client"),
+            tracker,
+            sep10,
+        })
+    }
+
+    pub fn new_for_tests(tracker: Arc<super::tracker::TrackerStore>) -> Self {
         Self {
             client: crate::http_client::build_resilient_client()
                 .expect("Failed to build resilient HTTP client"),
@@ -173,7 +192,7 @@ mod tests {
         db.run_migrations().await.ok();
 
         let tracker = std::sync::Arc::new(super::super::tracker::TrackerStore::new(db));
-        let client = Sep24Client::new(tracker.clone());
+        let client = Sep24Client::new_for_tests(tracker.clone());
 
         let response = client
             .initiate_deposit("anchor.example.com", "USDC", "GTESTACCOUNT")
