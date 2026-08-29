@@ -13,6 +13,7 @@ use crate::error::AppError;
 use crate::router::slippage::SlippageError;
 use crate::router::{RouteOption, RoutePlanner};
 use axum::{
+    extract::Query,
     routing::{get, post},
     Extension, Json, Router,
 };
@@ -125,6 +126,65 @@ pub struct HealthResponse {
     pub timestamp: String,
 }
 
+#[derive(Deserialize)]
+pub struct PortfolioRequest {
+    pub account: String,
+}
+
+#[derive(Serialize)]
+pub struct PortfolioResponse {
+    pub balance: f64,
+    pub transactions: Vec<PortfolioTransaction>,
+}
+
+#[derive(Serialize)]
+pub struct PortfolioTransaction {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub name: String,
+    pub username: String,
+    pub avatar: String,
+    pub amount: f64,
+    pub note: Option<String>,
+    pub date: String,
+    pub status: String,
+}
+
+#[derive(Deserialize)]
+struct HorizonAccount {
+    balances: Vec<HorizonBalance>,
+}
+
+#[derive(Deserialize)]
+struct HorizonBalance {
+    asset_type: String,
+    asset_code: Option<String>,
+    balance: String,
+}
+
+#[derive(Deserialize)]
+struct HorizonPayments {
+    _embedded: HorizonPaymentEmbedded,
+}
+
+#[derive(Deserialize)]
+struct HorizonPaymentEmbedded {
+    records: Vec<HorizonPayment>,
+}
+
+#[derive(Deserialize)]
+struct HorizonPayment {
+    id: String,
+    from: Option<String>,
+    to: Option<String>,
+    amount: String,
+    created_at: String,
+    transaction_hash: Option<String>,
+    asset_type: String,
+    asset_code: Option<String>,
+}
+
 /// Builds the application router.
 ///
 /// `db` injects the (optional) database used by `/execute-route`. `verifier`
@@ -167,6 +227,7 @@ pub fn create_router_with_cache(
 
     let router = Router::new()
         .route("/api/v1/health", get(health_handler))
+        .route("/api/v1/wallet/portfolio", get(portfolio_handler))
         .route(
             "/api/v1/config",
             get(config_handler).layer(axum::middleware::from_fn(middleware::etag_middleware)),
@@ -219,6 +280,94 @@ async fn health_handler() -> Json<HealthResponse> {
         version: "0.1.0",
         timestamp: chrono::Utc::now().to_rfc3339(),
     })
+}
+
+async fn portfolio_handler(
+    Extension(config): Extension<Arc<AppConfig>>,
+    Query(payload): Query<PortfolioRequest>,
+) -> Result<Json<PortfolioResponse>, AppError> {
+    validate_stellar_address(&payload.account)
+        .map_err(|error| AppError::BadRequest(format!("Invalid account address: {error}")))?;
+
+    let client = crate::http_client::build_resilient_client()
+        .map_err(|error| AppError::Internal(error.into()))?;
+    let horizon_url = config.stellar_horizon_url.trim_end_matches('/');
+    let account_url = format!("{horizon_url}/accounts/{}", payload.account);
+    let account = client
+        .get(&account_url)
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Stellar account lookup failed: {error}"))
+        })?
+        .error_for_status()
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Stellar account lookup failed: {error}"))
+        })?
+        .json::<HorizonAccount>()
+        .await
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Invalid Stellar account response: {error}"))
+        })?;
+
+    let balance = account
+        .balances
+        .iter()
+        .filter(|balance| {
+            balance.asset_type == "native" || balance.asset_code.as_deref() == Some("USDC")
+        })
+        .filter_map(|balance| balance.balance.parse::<f64>().ok())
+        .sum();
+
+    let payments_url = format!(
+        "{horizon_url}/accounts/{}/payments?limit=50&order=desc",
+        payload.account
+    );
+    let payments = client
+        .get(&payments_url)
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Stellar payments lookup failed: {error}"))
+        })?
+        .error_for_status()
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Stellar payments lookup failed: {error}"))
+        })?
+        .json::<HorizonPayments>()
+        .await
+        .map_err(|error| {
+            AppError::ServiceUnavailable(format!("Invalid Stellar payments response: {error}"))
+        })?;
+
+    let transactions = payments
+        ._embedded
+        .records
+        .into_iter()
+        .filter_map(|payment| {
+            if payment.asset_type != "native" && payment.asset_code.as_deref() != Some("USDC") {
+                return None;
+            }
+            let received = payment.to.as_deref() == Some(payload.account.as_str());
+            let counterparty = if received { payment.from? } else { payment.to? };
+            Some(PortfolioTransaction {
+                id: payment.transaction_hash.unwrap_or(payment.id),
+                type_: if received { "received" } else { "sent" }.to_string(),
+                name: counterparty.clone(),
+                username: counterparty,
+                avatar: String::new(),
+                amount: payment.amount.parse().ok()?,
+                note: None,
+                date: payment.created_at,
+                status: "completed".to_string(),
+            })
+        })
+        .collect();
+
+    Ok(Json(PortfolioResponse {
+        balance,
+        transactions,
+    }))
 }
 
 #[tracing::instrument(err)]
