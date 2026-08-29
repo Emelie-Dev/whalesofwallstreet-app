@@ -186,6 +186,21 @@ struct HorizonPayment {
     asset_code: Option<String>,
 }
 
+/// Shared service handles the router injects as `Extension`s — every route
+/// handler reaches these the same way, so they're bundled here instead of
+/// as separate positional parameters to [`create_router_with_cache`].
+/// `verifier` and `request_timeout` stay separate parameters since they
+/// drive router construction itself (which middleware gets layered on)
+/// rather than being handed to handlers untouched.
+pub struct RouterDeps {
+    pub db: Option<Database>,
+    pub tracker: Option<Arc<TrackerStore>>,
+    pub cache: ClusterCache,
+    pub config: Arc<AppConfig>,
+    pub sep38_client: Arc<Sep38Client>,
+    pub mempool_risk_registry: Arc<PoolRiskRegistry>,
+}
+
 /// Builds the application router.
 ///
 /// `db` injects the (optional) database used by `/execute-route`. `verifier`
@@ -195,27 +210,33 @@ struct HorizonPayment {
 /// local development — see `main`, which warns loudly in that case).
 pub fn create_router(db: Option<Database>, verifier: Option<SignatureVerifier>) -> Router {
     create_router_with_cache(
-        db,
         verifier,
-        None,
         Duration::from_secs(30),
-        ClusterCache::local_only(),
-        Arc::new(AppConfig::default()),
-        Arc::new(Sep38Client::new()),
-        Arc::new(PoolRiskRegistry::new()),
+        RouterDeps {
+            db,
+            tracker: None,
+            cache: ClusterCache::local_only(),
+            config: Arc::new(AppConfig::default()),
+            sep38_client: Arc::new(Sep38Client::new()),
+            mempool_risk_registry: Arc::new(PoolRiskRegistry::new()),
+        },
     )
 }
 
 pub fn create_router_with_cache(
-    db: Option<Database>,
     verifier: Option<SignatureVerifier>,
-    tracker: Option<Arc<TrackerStore>>,
     request_timeout: Duration,
-    cache: ClusterCache,
-    config: Arc<AppConfig>,
-    sep38_client: Arc<Sep38Client>,
-    mempool_risk_registry: Arc<PoolRiskRegistry>,
+    deps: RouterDeps,
 ) -> Router {
+    let RouterDeps {
+        db,
+        tracker,
+        cache,
+        config,
+        sep38_client,
+        mempool_risk_registry,
+    } = deps;
+
     // Every route shares a global per-IP budget; `/api/v1/quote` additionally
     // gets its own, stricter budget since it runs a non-trivial pathfinding
     // search per request.

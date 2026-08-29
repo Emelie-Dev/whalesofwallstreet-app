@@ -182,14 +182,16 @@ async fn main() -> anyhow::Result<()> {
     let cors_layer = build_cors_layer(&config);
     let sep38_client = std::sync::Arc::new(wow_engine::anchor::sep38::Sep38Client::new());
     let app = wow_engine::api::create_router_with_cache(
-        db,
         verifier,
-        tracker,
         request_timeout,
-        cluster_cache,
-        config.clone(),
-        sep38_client,
-        mempool_risk_registry,
+        wow_engine::api::RouterDeps {
+            db,
+            tracker,
+            cache: cluster_cache,
+            config: config.clone(),
+            sep38_client,
+            mempool_risk_registry,
+        },
     )
     .layer(cors_layer)
     .layer(TraceLayer::new_for_http());

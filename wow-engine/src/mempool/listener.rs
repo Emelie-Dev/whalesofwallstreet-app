@@ -9,6 +9,18 @@
 //! listener can never add latency to a live `/quote` request — it only
 //! ever writes into [`PoolRiskRegistry`], which [`crate::router::RoutePlanner`]
 //! reads independently.
+//!
+//! The subscription uses Alchemy's `alchemy_pendingTransactions` extension
+//! (address-filtered, full-transaction) rather than the standard
+//! `eth_subscribe("newPendingTransactions")` every provider supports —
+//! that server-side address filter is what keeps this listener from
+//! having to decode the entire public mempool (see the module doc on
+//! `crate::mempool` for the CPU-cost reasoning). A provider that doesn't
+//! implement the extension (e.g. Infura) rejects the subscribe request
+//! with a JSON-RPC error; [`run_single_connection`] treats that as a
+//! connection failure — surfaced through the same `tracing::warn!` the
+//! reconnect loop already logs on every other failure — rather than
+//! silently listening forever to a stream that will never emit anything.
 
 use super::decoder::{decode_pending_tx, DecodedKind, RawPendingTx};
 use super::risk::PoolRiskRegistry;
@@ -117,7 +129,30 @@ async fn run_single_connection(
     write
         .send(Message::Text(subscribe.to_string().into()))
         .await?;
-    tracing::info!(contracts = ?watched, "mempool listener subscribed to pending transactions");
+
+    // Confirm the subscription actually succeeded before trusting this
+    // connection to ever emit a pending tx. A provider that rejects
+    // `alchemy_pendingTransactions` returns a JSON-RPC error here instead
+    // of a subscription id — without this check that error is just another
+    // frame `handle_message` silently can't parse into an `eth_subscription`
+    // shape and drops, leaving a connection that looks alive and subscribed
+    // but will never see a single transaction.
+    let subscription_id = loop {
+        match read.next().await.ok_or_else(|| {
+            anyhow::anyhow!("connection closed before subscription was acknowledged")
+        })?? {
+            Message::Text(text) => break parse_subscribe_ack(&text)?,
+            Message::Close(_) => {
+                anyhow::bail!("connection closed before subscription was acknowledged")
+            }
+            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+        }
+    };
+    tracing::info!(
+        contracts = ?watched,
+        subscription_id = %subscription_id,
+        "mempool listener subscribed to pending transactions"
+    );
 
     while let Some(msg) = read.next().await {
         match msg? {
@@ -130,6 +165,28 @@ async fn run_single_connection(
     }
 
     Ok(())
+}
+
+/// Parses the JSON-RPC response to the `eth_subscribe` request: `Ok` with
+/// the subscription id on success, `Err` on a JSON-RPC error response (a
+/// provider rejecting `alchemy_pendingTransactions`) or any other shape
+/// that isn't a valid subscription ack.
+fn parse_subscribe_ack(text: &str) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|err| anyhow::anyhow!("subscription ack was not valid JSON: {err}"))?;
+
+    if let Some(error) = value.get("error") {
+        anyhow::bail!(
+            "mempool WSS provider rejected the subscribe request: {error} \
+             (alchemy_pendingTransactions is an Alchemy-specific extension; \
+             this endpoint may not support it — see MEMPOOL_WSS_URL's doc comment)"
+        );
+    }
+
+    match value.get("result").and_then(|r| r.as_str()) {
+        Some(id) => Ok(id.to_string()),
+        None => anyhow::bail!("subscription ack had no result subscription id: {text}"),
+    }
 }
 
 /// Parses one WSS text frame as an `eth_subscription` notification,
@@ -231,6 +288,74 @@ mod tests {
 
         let pool = PoolKey::new(Chain::Ethereum, "ETH", "USDC");
         assert!(registry.is_high_risk(&pool).await);
+    }
+
+    #[test]
+    fn parse_subscribe_ack_accepts_a_valid_result() {
+        let id = parse_subscribe_ack(r#"{"jsonrpc":"2.0","id":1,"result":"0xabc123"}"#).unwrap();
+        assert_eq!(id, "0xabc123");
+    }
+
+    #[test]
+    fn parse_subscribe_ack_rejects_a_json_rpc_error() {
+        // The exact shape a provider that doesn't implement Alchemy's
+        // alchemy_pendingTransactions extension (e.g. Infura) returns.
+        let err = parse_subscribe_ack(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("rejected"));
+    }
+
+    #[test]
+    fn parse_subscribe_ack_rejects_malformed_json() {
+        assert!(parse_subscribe_ack("not json").is_err());
+    }
+
+    #[test]
+    fn parse_subscribe_ack_rejects_a_response_with_no_result() {
+        assert!(parse_subscribe_ack(r#"{"jsonrpc":"2.0","id":1}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn subscribe_rejection_surfaces_as_a_connection_error_not_silence() {
+        // Regression test for the exact failure mode a JSON-RPC error to
+        // the subscribe request used to produce: run_single_connection
+        // would enter its read loop anyway, handle_message would silently
+        // drop the error frame (it doesn't parse as an eth_subscription
+        // notification), and the listener would sit there "connected" and
+        // "subscribed" forever without ever seeing a pending transaction.
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+
+        tokio::spawn(async move {
+            let (stream, _) = tcp.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await; // the subscribe request
+            let _ = ws
+                .send(Message::Text(
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#
+                        .into(),
+                ))
+                .await;
+        });
+
+        let registry = Arc::new(PoolRiskRegistry::new());
+        let mut detector = SandwichDetector::new();
+        let result = run_single_connection(
+            &url,
+            Chain::Ethereum,
+            &["0xdeadbeef".to_string()],
+            &registry,
+            &mut detector,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a rejected subscribe must surface as a connection error, not a silent no-op listener"
+        );
     }
 
     #[tokio::test]
