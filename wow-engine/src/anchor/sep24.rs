@@ -131,6 +131,7 @@ impl Sep24Client {
 ///
 /// Split out from [`Sep24Client::initiate_flow`] so the URL format can be
 /// unit tested without needing a live [`super::tracker::TrackerStore`].
+#[allow(dead_code)]
 fn build_interactive_url(
     kind: &str,
     anchor_domain: &str,

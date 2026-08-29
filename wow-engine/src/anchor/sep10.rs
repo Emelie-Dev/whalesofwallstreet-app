@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use base64::Engine;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -110,6 +110,7 @@ impl<'a> XdrReader<'a> {
         Ok(u32::from_be_bytes(bytes))
     }
 
+    #[allow(dead_code)]
     fn read_i32(&mut self) -> Result<i32, AppError> {
         if self.remaining() < 4 {
             return Err(bad_request("XDR: truncated i32"));
@@ -528,9 +529,8 @@ pub fn parse_and_validate_challenge(
     }
 
     let mut found_client_account = None;
-    let mut found_nonce = false;
     for op in &tx.operations {
-        let (md_key, md_value, op_source) = match &op.body {
+        let (_md_key, md_value, op_source) = match &op.body {
             OperationBody::ManageData(md) => (
                 &md.key,
                 &md.value,
@@ -544,7 +544,6 @@ pub fn parse_and_validate_challenge(
         if op_source_arr == *expected_client_account {
             if let Some(value) = md_value {
                 if value.len() == 48 || value.len() == 32 || value.len() == 64 {
-                    found_nonce = true;
                     found_client_account = Some(op_source_arr);
                 }
             }
@@ -581,15 +580,13 @@ pub fn parse_and_validate_challenge(
     let tx_hash = transaction_hash(network_passphrase, tx);
     let mut has_valid_anchor_sig = false;
     for ds in &env.signatures {
-        if ds.hint == signature_hint(&anchor_account) {
-            if ds.signature.len() == 64 {
-                let sig_arr: [u8; 64] = ds.signature.as_slice().try_into().unwrap();
-                let sig = Signature::from_bytes(&sig_arr);
-                if let Ok(vk) = VerifyingKey::from_bytes(&anchor_account) {
-                    if vk.verify_strict(&tx_hash, &sig).is_ok() {
-                        has_valid_anchor_sig = true;
-                        break;
-                    }
+        if ds.hint == signature_hint(&anchor_account) && ds.signature.len() == 64 {
+            let sig_arr: [u8; 64] = ds.signature.as_slice().try_into().unwrap();
+            let sig = Signature::from_bytes(&sig_arr);
+            if let Ok(vk) = VerifyingKey::from_bytes(&anchor_account) {
+                if vk.verify_strict(&tx_hash, &sig).is_ok() {
+                    has_valid_anchor_sig = true;
+                    break;
                 }
             }
         }
@@ -657,7 +654,7 @@ fn public_key_from_stellar_account(account: &str) -> Result<[u8; 32], AppError> 
     hasher.update(&raw[0..33]);
     let checksum_full: [u8; 32] = hasher.finalize().into();
     let mut hasher2 = Sha256::new();
-    hasher2.update(&checksum_full);
+    hasher2.update(checksum_full);
     let checksum: [u8; 32] = hasher2.finalize().into();
     if checksum[0] != raw[33] || checksum[1] != raw[34] {
         return Err(bad_request("Invalid Stellar account ID checksum"));
@@ -681,7 +678,7 @@ fn secret_key_from_stellar_seed(seed: &str) -> Result<SigningKey, AppError> {
     hasher.update(&raw[0..33]);
     let checksum_full: [u8; 32] = hasher.finalize().into();
     let mut hasher2 = Sha256::new();
-    hasher2.update(&checksum_full);
+    hasher2.update(checksum_full);
     let checksum: [u8; 32] = hasher2.finalize().into();
     if checksum[0] != raw[33] || checksum[1] != raw[34] {
         return Err(bad_request("Invalid Stellar secret seed checksum"));
@@ -1177,7 +1174,7 @@ mod tests {
         hasher.update(&raw[0..33]);
         let c1: [u8; 32] = hasher.finalize().into();
         let mut hasher2 = Sha256::new();
-        hasher2.update(&c1);
+        hasher2.update(c1);
         let c2: [u8; 32] = hasher2.finalize().into();
         raw[33] = c2[0];
         raw[34] = c2[1];
@@ -1197,7 +1194,7 @@ mod tests {
         hasher.update(&raw[0..33]);
         let c1: [u8; 32] = hasher.finalize().into();
         let mut hasher2 = Sha256::new();
-        hasher2.update(&c1);
+        hasher2.update(c1);
         let c2: [u8; 32] = hasher2.finalize().into();
         raw[33] = c2[0];
         raw[34] = c2[1];
@@ -1216,7 +1213,7 @@ mod tests {
         h1.update(&raw_account[0..33]);
         let c1: [u8; 32] = h1.finalize().into();
         let mut h2 = Sha256::new();
-        h2.update(&c1);
+        h2.update(c1);
         let c2: [u8; 32] = h2.finalize().into();
         raw_account[33] = c2[0];
         raw_account[34] = c2[1];
@@ -1229,7 +1226,7 @@ mod tests {
         hs1.update(&raw_seed[0..33]);
         let sc1: [u8; 32] = hs1.finalize().into();
         let mut hs2 = Sha256::new();
-        hs2.update(&sc1);
+        hs2.update(sc1);
         let sc2: [u8; 32] = hs2.finalize().into();
         raw_seed[33] = sc2[0];
         raw_seed[34] = sc2[1];
