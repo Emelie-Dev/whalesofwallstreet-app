@@ -1233,7 +1233,10 @@ mod tests {
         let secret_str = data_encoding::BASE32_NOPAD.encode(&raw_seed);
 
         let entry = format!("{account_str}={secret_str}");
-        let err = Sep10Client::from_config(&[entry], 300, 60).unwrap_err();
+        let err = match Sep10Client::from_config(&[entry], 300, 60) {
+            Ok(_) => panic!("expected from_config to reject mismatched account/secret"),
+            Err(e) => e,
+        };
         let _ = pk;
         assert!(err.to_string().contains("does not match"));
     }
