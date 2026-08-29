@@ -477,7 +477,7 @@ async fn deposit_handler(
         config.sep10_challenge_max_age_secs,
         config.sep10_challenge_max_future_skew_secs,
     )
-    .map_err(|e| AppError::Internal(e))?;
+    .map_err(AppError::Internal)?;
     let tx = client
         .initiate_deposit(
             &payload.anchor_domain,
@@ -521,7 +521,7 @@ async fn withdraw_handler(
         config.sep10_challenge_max_age_secs,
         config.sep10_challenge_max_future_skew_secs,
     )
-    .map_err(|e| AppError::Internal(e))?;
+    .map_err(AppError::Internal)?;
     let tx = client
         .initiate_withdrawal(
             &payload.anchor_domain,
