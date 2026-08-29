@@ -90,8 +90,13 @@ impl Sep24Client {
             .await?;
 
         // 3. Make POST request to interactive endpoint
-        let endpoint = format!("https://{}/sep24/transactions/{}/interactive", anchor_domain, kind);
-        let resp = self.client.post(&endpoint)
+        let endpoint = format!(
+            "https://{}/sep24/transactions/{}/interactive",
+            anchor_domain, kind
+        );
+        let resp = self
+            .client
+            .post(&endpoint)
             .bearer_auth(jwt)
             .json(&serde_json::json!({
                 "asset_code": asset_code,
@@ -103,7 +108,11 @@ impl Sep24Client {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("Anchor rejected interactive flow: {} - {}", status, body));
+            return Err(anyhow::anyhow!(
+                "Anchor rejected interactive flow: {} - {}",
+                status,
+                body
+            ));
         }
 
         let parsed: serde_json::Value = resp.json().await?;

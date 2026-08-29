@@ -220,7 +220,9 @@ fn decode_timebounds(reader: &mut XdrReader) -> Result<TimeBounds, AppError> {
 fn decode_memo(reader: &mut XdrReader) -> Result<Memo, AppError> {
     let type_ = reader.read_u32()?;
     if type_ != XDR_MEMO_NONE {
-        return Err(bad_request("XDR: unsupported memo type in SEP-10 challenge"));
+        return Err(bad_request(
+            "XDR: unsupported memo type in SEP-10 challenge",
+        ));
     }
     Ok(Memo::None)
 }
@@ -229,7 +231,9 @@ fn decode_operation(reader: &mut XdrReader) -> Result<Operation, AppError> {
     let source_account = reader.read_optional(|r| decode_muxed(r))?;
     let body_type = reader.read_u32()?;
     if body_type != XDR_OP_MANAGE_DATA {
-        return Err(bad_request("XDR: SEP-10 challenge must contain only ManageData ops"));
+        return Err(bad_request(
+            "XDR: SEP-10 challenge must contain only ManageData ops",
+        ));
     }
     let key = reader.read_string()?;
     let value = reader.read_optional(|r| r.read_opaque())?;
@@ -451,10 +455,7 @@ fn muxed_account_bytes(m: &MuxedAccount) -> [u8; 32] {
     }
 }
 
-fn resolve_network_passphrase(
-    response_passphrase: &Option<String>,
-    anchor_domain: &str,
-) -> String {
+fn resolve_network_passphrase(response_passphrase: &Option<String>, anchor_domain: &str) -> String {
     if let Some(p) = response_passphrase {
         return p.clone();
     }
@@ -490,9 +491,7 @@ pub fn parse_and_validate_challenge(
     let tx = &env.tx;
 
     if tx.seq_num != 0 {
-        return Err(bad_request(
-            "SEP-10 challenge must have sequence number 0",
-        ));
+        return Err(bad_request("SEP-10 challenge must have sequence number 0"));
     }
 
     let tb = tx
@@ -501,9 +500,7 @@ pub fn parse_and_validate_challenge(
         .ok_or_else(|| bad_request("SEP-10 challenge must have time bounds"))?;
 
     if tb.min_time == 0 {
-        return Err(bad_request(
-            "SEP-10 challenge minTime must be set",
-        ));
+        return Err(bad_request("SEP-10 challenge minTime must be set"));
     }
 
     let min_time_i64 = tb.min_time as i64;
@@ -519,9 +516,7 @@ pub fn parse_and_validate_challenge(
     }
 
     if tb.max_time != 0 && tb.max_time < tb.min_time {
-        return Err(bad_request(
-            "SEP-10 challenge maxTime must be >= minTime",
-        ));
+        return Err(bad_request("SEP-10 challenge maxTime must be >= minTime"));
     }
 
     let anchor_account = muxed_account_bytes(&tx.source_account);
@@ -558,7 +553,8 @@ pub fn parse_and_validate_challenge(
 
     if found_client_account.is_none() {
         for op in &tx.operations {
-            let op_source = op.source_account
+            let op_source = op
+                .source_account
                 .as_ref()
                 .map(muxed_account_bytes)
                 .unwrap_or(anchor_account);
@@ -568,13 +564,12 @@ pub fn parse_and_validate_challenge(
         }
     }
 
-    let client_account = found_client_account
-        .ok_or_else(|| bad_request("SEP-10 challenge missing ManageData op with client account as source"))?;
+    let client_account = found_client_account.ok_or_else(|| {
+        bad_request("SEP-10 challenge missing ManageData op with client account as source")
+    })?;
 
     if client_account != *expected_client_account {
-        return Err(bad_request(
-            "SEP-10 challenge client account mismatch",
-        ));
+        return Err(bad_request("SEP-10 challenge client account mismatch"));
     }
 
     if env.signatures.is_empty() {
@@ -722,7 +717,9 @@ impl Sep10Client {
                 .to_string();
             let secret = parts
                 .next()
-                .ok_or_else(|| anyhow::anyhow!("SEP10_SIGNING_KEYS missing secret for account {account}"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("SEP10_SIGNING_KEYS missing secret for account {account}")
+                })?
                 .trim()
                 .to_string();
             let pk = public_key_from_stellar_account(&account)
@@ -867,10 +864,7 @@ mod tests {
             source_account: MuxedAccount::Ed25519(AccountId(anchor_pk)),
             fee: 100,
             seq_num: 0,
-            time_bounds: Some(TimeBounds {
-                min_time,
-                max_time,
-            }),
+            time_bounds: Some(TimeBounds { min_time, max_time }),
             memo: Memo::None,
             operations: vec![Operation {
                 source_account: Some(MuxedAccount::Ed25519(AccountId(*client_pk))),
