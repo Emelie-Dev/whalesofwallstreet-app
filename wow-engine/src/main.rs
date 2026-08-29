@@ -147,14 +147,34 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(wow_engine::db::gc::run_historical_routes_gc(db));
     }
 
+    // Shared record of pools currently under suspected front-running
+    // attack (see wow_engine::mempool). Written by the mempool listener
+    // below, read by every RoutePlanner that shares this Arc — including
+    // the one the API layer builds per-request in api::create_router*.
+    let mempool_risk_registry = std::sync::Arc::new(wow_engine::mempool::PoolRiskRegistry::new());
+
     // Background task: periodically scans the liquidity graph for
     // arbitrage (negative-weight cycle) opportunities. Entirely read-only
     // and isolated from the request-serving path, so it never adds latency
     // to a live quote.
     let arbitrage_planner =
-        std::sync::Arc::new(wow_engine::router::RoutePlanner::new(config.clone()));
+        std::sync::Arc::new(wow_engine::router::RoutePlanner::with_risk_registry(
+            config.clone(),
+            mempool_risk_registry.clone(),
+        ));
     tokio::spawn(wow_engine::router::arbitrage::run_arbitrage_scanner(
         arbitrage_planner,
+    ));
+
+    // Background task: watches the Ethereum mempool over a WSS feed for
+    // pending transactions front-running our routes' pools, flagging them
+    // in `mempool_risk_registry` so live quotes widen slippage tolerance
+    // while an attack is in progress. A no-op (logs and returns) unless
+    // MEMPOOL_WSS_URL is configured.
+    tokio::spawn(wow_engine::mempool::listener::run_mempool_listener(
+        wow_engine::bridge::Chain::Ethereum,
+        config.clone(),
+        mempool_risk_registry.clone(),
     ));
 
     // 4. Initialize API router with CORS and configuration.
@@ -162,13 +182,16 @@ async fn main() -> anyhow::Result<()> {
     let cors_layer = build_cors_layer(&config);
     let sep38_client = std::sync::Arc::new(wow_engine::anchor::sep38::Sep38Client::new());
     let app = wow_engine::api::create_router_with_cache(
-        db,
         verifier,
-        tracker,
         request_timeout,
-        cluster_cache,
-        config.clone(),
-        sep38_client,
+        wow_engine::api::RouterDeps {
+            db,
+            tracker,
+            cache: cluster_cache,
+            config: config.clone(),
+            sep38_client,
+            mempool_risk_registry,
+        },
     )
     .layer(cors_layer)
     .layer(TraceLayer::new_for_http());

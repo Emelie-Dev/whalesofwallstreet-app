@@ -5,7 +5,7 @@ use std::time::Duration;
 use tower::ServiceExt; // for `oneshot`
 use wow_engine::anchor::sep38::Sep38Client;
 use wow_engine::api::cors::build_cors_layer;
-use wow_engine::api::{create_router, create_router_with_cache};
+use wow_engine::api::{create_router, create_router_with_cache, RouterDeps};
 use wow_engine::cache_sync::ClusterCache;
 use wow_engine::config::AppConfig;
 
@@ -38,12 +38,15 @@ fn quote_request_with_xff(xff: Option<&str>) -> Request<Body> {
 fn router_with_config(config: AppConfig) -> axum::Router {
     create_router_with_cache(
         None,
-        None,
-        None,
         Duration::from_secs(30),
-        ClusterCache::local_only(),
-        Arc::new(config),
-        Arc::new(Sep38Client::new()),
+        RouterDeps {
+            db: None,
+            tracker: None,
+            cache: ClusterCache::local_only(),
+            config: Arc::new(config),
+            sep38_client: Arc::new(Sep38Client::new()),
+            mempool_risk_registry: Arc::new(wow_engine::mempool::PoolRiskRegistry::new()),
+        },
     )
 }
 

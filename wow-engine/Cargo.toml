@@ -21,7 +21,7 @@ reqwest-retry = "0.9.1"
 retry-policies = "0.5.2"
 tracing = "0.1.44"
 envy = "0.4.2"
-moka = { version = "0.12.15", features = ["future"] }
+moka = { version = "0.12.15", features = ["future", "sync"] }
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 sha3 = "0.10.8"
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls", "uuid", "chrono"] }
@@ -33,6 +33,7 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 futures-util = "0.3"
 url = "2.5"
 async-trait = "0.1"
+tokio-tungstenite = { version = "0.30.0", features = ["connect", "rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 axum-test = "16"

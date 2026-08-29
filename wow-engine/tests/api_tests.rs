@@ -1,6 +1,6 @@
 use axum_test::TestServer;
 use serde_json::json;
-use wow_engine::api::{create_router, create_router_with_cache};
+use wow_engine::api::{create_router, create_router_with_cache, RouterDeps};
 
 #[tokio::test]
 async fn test_health_endpoint() {
@@ -304,13 +304,16 @@ mod anchor_deposit_withdraw_success {
         let tracker = Arc::new(TrackerStore::new(db.clone()));
 
         Some(create_router_with_cache(
-            Some(db),
             None,
-            Some(tracker),
             Duration::from_secs(30),
-            ClusterCache::local_only(),
-            Arc::new(AppConfig::default()),
-            Arc::new(Sep38Client::new()),
+            RouterDeps {
+                db: Some(db),
+                tracker: Some(tracker),
+                cache: ClusterCache::local_only(),
+                config: Arc::new(AppConfig::default()),
+                sep38_client: Arc::new(Sep38Client::new()),
+                mempool_risk_registry: Arc::new(wow_engine::mempool::PoolRiskRegistry::new()),
+            },
         ))
     }
 
