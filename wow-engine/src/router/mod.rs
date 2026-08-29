@@ -6,6 +6,8 @@ use crate::bridge::{
     cctp::CctpClient, debridge::DeBridgeClient, gas_oracle::GasOracle, BridgeProvider, Chain,
 };
 use crate::config::AppConfig;
+use crate::mempool::risk::HIGH_RISK_SLIPPAGE_PENALTY_BPS;
+use crate::mempool::{PoolKey, PoolRiskRegistry};
 use crate::router::dex::DexProvider;
 use crate::router::slippage::SlippageError;
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,14 @@ pub struct RouteOption {
 pub struct RoutePlanner {
     debridge: DeBridgeClient,
     cctp: CctpClient,
+    /// Pools currently flagged as under suspected front-running attack by
+    /// the mempool listener (see [`crate::mempool`]). Checked on every DEX
+    /// leg quoted below to widen that leg's slippage tolerance while the
+    /// flag is live. Shared with (and only ever written by) the listener
+    /// task when constructed via [`Self::with_risk_registry`]; a plain
+    /// [`Self::new`] gets a private, always-empty registry, so routing
+    /// behaves identically whether or not the mempool listener is running.
+    risk_registry: Arc<PoolRiskRegistry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -80,10 +90,22 @@ fn get_usd_value(asset: &str, amount: u64) -> f64 {
 
 impl RoutePlanner {
     pub fn new(config: Arc<AppConfig>) -> Self {
+        Self::with_risk_registry(config, Arc::new(PoolRiskRegistry::new()))
+    }
+
+    /// Builds a planner that shares `risk_registry` with an external
+    /// writer — in practice, `main.rs` wiring the same registry into both
+    /// this planner and [`crate::mempool::listener::run_mempool_listener`]
+    /// so a live front-running detection actually reaches quoting.
+    pub fn with_risk_registry(
+        config: Arc<AppConfig>,
+        risk_registry: Arc<PoolRiskRegistry>,
+    ) -> Self {
         let oracle = Arc::new(GasOracle::new(config.clone()));
         Self {
             debridge: DeBridgeClient::new(oracle.clone()),
             cctp: CctpClient::new(oracle, config),
+            risk_registry,
         }
     }
 
@@ -190,6 +212,30 @@ impl RoutePlanner {
                             let next_usd = get_usd_value(target_asset, quote.amount_out);
                             let next_usd_scaled = (next_usd * 1000.0) as u64;
 
+                            // Widen this leg's slippage tolerance when the
+                            // mempool listener has this pool flagged as
+                            // under a suspected front-run/sandwich attack —
+                            // see crate::mempool. This runs once per
+                            // candidate edge in the search, not once per
+                            // request, so the common case (no listener
+                            // running, or one that hasn't flagged
+                            // anything recently) is short-circuited via
+                            // `is_empty()` before paying for the PoolKey
+                            // allocation or a real cache lookup.
+                            let slippage_bps = if self.risk_registry.is_empty() {
+                                quote.slippage_bps
+                            } else {
+                                let pool =
+                                    PoolKey::new(state.node.chain, &state.node.asset, target_asset);
+                                if self.risk_registry.is_high_risk(&pool) {
+                                    quote
+                                        .slippage_bps
+                                        .saturating_add(HIGH_RISK_SLIPPAGE_PENALTY_BPS)
+                                } else {
+                                    quote.slippage_bps
+                                }
+                            };
+
                             let best = best_seen.entry(next_node.clone()).or_insert(0);
                             if multi_path || next_usd_scaled > *best {
                                 if next_usd_scaled > *best {
@@ -204,7 +250,7 @@ impl RoutePlanner {
                                     estimated_fee_usd: quote.estimated_fee_usd,
                                     duration_seconds: quote.duration_seconds,
                                     price_impact_bps: quote.price_impact_bps,
-                                    slippage_bps: quote.slippage_bps,
+                                    slippage_bps,
                                     execution_payload: None,
                                 });
                                 pq.push(State {
@@ -533,5 +579,50 @@ mod tests {
             edges.iter().any(|e| !e.label.contains("bridge")),
             "should include at least one same-chain DEX edge"
         );
+    }
+
+    #[tokio::test]
+    async fn high_risk_pool_flag_widens_the_routes_slippage_tolerance() {
+        let config = Arc::new(AppConfig::default());
+        let registry = Arc::new(PoolRiskRegistry::new());
+        let planner = RoutePlanner::with_risk_registry(config, registry.clone());
+
+        let baseline = planner
+            .find_best_route(Chain::Ethereum, Chain::Ethereum, "ETH", "USDC", 1, false)
+            .await
+            .unwrap();
+        let baseline_slippage = baseline[0].slippage_bps;
+
+        registry.flag(
+            PoolKey::new(Chain::Ethereum, "ETH", "USDC"),
+            "test".to_string(),
+        );
+
+        let flagged = planner
+            .find_best_route(Chain::Ethereum, Chain::Ethereum, "ETH", "USDC", 1, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            flagged[0].slippage_bps,
+            baseline_slippage + HIGH_RISK_SLIPPAGE_PENALTY_BPS
+        );
+    }
+
+    #[tokio::test]
+    async fn unflagged_pool_leaves_slippage_unchanged_across_calls() {
+        let config = Arc::new(AppConfig::default());
+        let planner = RoutePlanner::new(config);
+
+        let first = planner
+            .find_best_route(Chain::Ethereum, Chain::Ethereum, "ETH", "USDC", 1, false)
+            .await
+            .unwrap();
+        let second = planner
+            .find_best_route(Chain::Ethereum, Chain::Ethereum, "ETH", "USDC", 1, false)
+            .await
+            .unwrap();
+
+        assert_eq!(first[0].slippage_bps, second[0].slippage_bps);
     }
 }

@@ -1,6 +1,6 @@
 use axum_test::TestServer;
 use serde_json::json;
-use wow_engine::api::{create_router, create_router_with_cache};
+use wow_engine::api::{create_router, create_router_with_cache, RouterDeps};
 
 #[tokio::test]
 async fn test_health_endpoint() {
@@ -215,28 +215,61 @@ async fn test_anchor_quote_invalid_amount() {
     assert!(err_msg.contains("Sell amount must be greater than zero"));
 }
 
+/// Regression coverage for the SSRF closed by threading `AppConfig` (and
+/// its `allowed_anchor_domains` allowlist) into `anchor_quote_handler`:
+/// `fetch_anchor_price` makes a live outbound HTTP request to whatever
+/// `anchor_domain` the (unauthenticated — see `auth::PUBLIC_PATHS`) caller
+/// supplies, so the handler must reject anything not allowlisted, and must
+/// reject a raw IP address even if it somehow were allowlisted.
+///
+/// A genuine 200 end-to-end through this handler needs an `anchor_domain`
+/// that is both allowlisted *and* resolves to a mock server — the
+/// allowlist works on domain names, not IPs, and there's no DNS mocking in
+/// this test harness, so that combination isn't available here. The live
+/// pricing fetch itself (success + fallback-provider paths) is covered at
+/// the `Sep38Client` level in `src/anchor/sep38.rs`'s own tests, which
+/// call `get_indicative_quote` directly and so aren't subject to (or
+/// testing) this handler-level allowlist.
 #[tokio::test]
-async fn test_anchor_quote_endpoint_success() {
-    // Sep38Client is stateless (no DB dependency), so this success path
-    // runs unconditionally, unlike the deposit/withdraw success tests below.
+async fn test_anchor_quote_endpoint_rejects_non_allowlisted_domain() {
     let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     let payload = json!({
-        "anchor_domain": "test.com",
+        "anchor_domain": "attacker-controlled.example",
         "sell_asset": "USDC",
         "buy_asset": "NGN",
         "sell_amount": 100.0
     });
 
     let response = server.post("/api/v1/anchor/quote").json(&payload).await;
-    response.assert_status_ok();
+    response.assert_status_bad_request();
+    assert!(response.text().contains("not allowlisted"));
+}
 
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["sell_asset"], "USDC");
-    assert_eq!(body["buy_asset"], "NGN");
-    assert_eq!(body["price"], "1450.0000000");
-    assert!(body["id"].as_str().unwrap().starts_with("q_sep38_"));
+#[tokio::test]
+async fn test_anchor_quote_endpoint_rejects_ip_address_as_domain() {
+    // The literal SSRF vector: pointing anchor_domain at a raw IP (e.g. an
+    // internal host or a cloud metadata address like 169.254.169.254)
+    // instead of a hostname. With the real default config this is rejected
+    // by the allowlist check before the IP-format check ever runs — a bare
+    // IP is never allowlisted in practice — which is itself sufficient
+    // protection. `validation.rs`'s own tests cover the deeper IP-format
+    // rejection directly, for the case where an IP was mistakenly
+    // allowlisted.
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    let payload = json!({
+        "anchor_domain": "169.254.169.254",
+        "sell_asset": "USDC",
+        "buy_asset": "NGN",
+        "sell_amount": 100.0
+    });
+
+    let response = server.post("/api/v1/anchor/quote").json(&payload).await;
+    response.assert_status_bad_request();
+    assert!(response.text().contains("not allowlisted"));
 }
 
 /// Success-path tests for the anchor deposit/withdraw endpoints. These
@@ -248,6 +281,7 @@ mod anchor_deposit_withdraw_success {
     use super::*;
     use std::sync::Arc;
     use std::time::Duration;
+    use wow_engine::anchor::sep38::Sep38Client;
     use wow_engine::anchor::tracker::TrackerStore;
     use wow_engine::cache_sync::ClusterCache;
     use wow_engine::config::AppConfig;
@@ -270,12 +304,16 @@ mod anchor_deposit_withdraw_success {
         let tracker = Arc::new(TrackerStore::new(db.clone()));
 
         Some(create_router_with_cache(
-            Some(db),
             None,
-            Some(tracker),
             Duration::from_secs(30),
-            ClusterCache::local_only(),
-            Arc::new(AppConfig::default()),
+            RouterDeps {
+                db: Some(db),
+                tracker: Some(tracker),
+                cache: ClusterCache::local_only(),
+                config: Arc::new(AppConfig::default()),
+                sep38_client: Arc::new(Sep38Client::new()),
+                mempool_risk_registry: Arc::new(wow_engine::mempool::PoolRiskRegistry::new()),
+            },
         ))
     }
 

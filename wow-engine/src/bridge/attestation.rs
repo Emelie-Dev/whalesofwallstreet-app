@@ -596,7 +596,12 @@ impl<S: AttesterKeySource> AttestationVerifier<S> {
         let mut previous_signer: Option<AttesterAddress> = None;
         let mut valid_signatures = 0usize;
 
-        for (index, raw_sig) in attestation.chunks_exact(SIGNATURE_LEN).enumerate() {
+        for (index, raw_sig) in attestation
+            .as_chunks::<SIGNATURE_LEN>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let signer = recover_signer(&digest, raw_sig, index)?;
 
             if !attesters.contains(&signer) {

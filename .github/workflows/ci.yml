@@ -2,13 +2,13 @@ name: Wow Engine CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
-      - 'wow-engine/**'
+      - "wow-engine/**"
   pull_request:
-    branches: [ main ]
+    branches: [main]
     paths:
-      - 'wow-engine/**'
+      - "wow-engine/**"
 
 jobs:
   test:
@@ -132,6 +132,7 @@ jobs:
 
       - name: Run Benchmarks
         run: |
+          rm -rf target/criterion
           cargo bench --bench router_benchmarks -- --output-format bencher | tee benchmark_result.txt
         env:
           MOCK_GAS_ORACLE: "true"
@@ -140,12 +141,12 @@ jobs:
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: Whales of Wall Street Router Benchmarks
-          tool: 'cargo'
+          tool: "cargo"
           output-file-path: wow-engine/benchmark_result.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          comment-always: true
+          comment-always: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
           fail-on-alert: true
-          alert-threshold: '105%'
+          alert-threshold: "105%"
           external-data-json-path: ./cache/benchmark-data.json
 
       - name: Save benchmark data

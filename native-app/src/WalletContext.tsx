@@ -1,6 +1,11 @@
-import React, { createContext, useContext, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
-import { currentUser as initialUser, transactions as initialTransactions, Transaction } from "./data/mockData";
+import React, { createContext, useContext } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { currentUser as initialUser, Transaction } from "./data/mockData";
+
+type WalletPortfolio = {
+  balance: number;
+  transactions: Transaction[];
+};
 
 type WalletContextType = {
   balance: number;
@@ -10,41 +15,80 @@ type WalletContextType = {
   withdraw: (amount: number, bank: string) => void;
   isDepositing: boolean;
   isWithdrawing: boolean;
+  isOffline: boolean;
+  isPortfolioUnavailable: boolean;
+  refreshPortfolio: () => Promise<void>;
 };
 
 const WalletContext = createContext<WalletContextType | undefined>(undefined);
 
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:8080";
+const API_BASE_URL =
+  process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:8080";
+const portfolioQueryKey = ["wallet-portfolio"] as const;
+
+const loadWalletPortfolio = async (): Promise<WalletPortfolio> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/wallet/portfolio?account=${encodeURIComponent(initialUser.stellarAddress)}`,
+  );
+  if (!response.ok) throw new Error("Portfolio lookup failed");
+  return response.json() as Promise<WalletPortfolio>;
+};
 
 export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
-  const [balance, setBalance] = useState(initialUser.balance);
-  const [transactions, setTransactions] = useState<Transaction[]>(initialTransactions);
+  const queryClient = useQueryClient();
+  const portfolioQuery = useQuery({
+    queryKey: portfolioQueryKey,
+    queryFn: loadWalletPortfolio,
+    staleTime: Infinity,
+  });
+  const portfolio = portfolioQuery.data;
+  const balance = portfolio?.balance ?? 0;
+  const transactions = portfolio?.transactions ?? [];
+  const isOffline = portfolioQuery.fetchStatus === "paused";
+  const isPortfolioUnavailable =
+    !portfolio && (isOffline || portfolioQuery.isError);
 
-  const addTransaction = (newTx: Omit<Transaction, "id" | "date" | "status">) => {
+  const updatePortfolio = (
+    updater: (current: WalletPortfolio) => WalletPortfolio,
+  ) => {
+    queryClient.setQueryData<WalletPortfolio>(portfolioQueryKey, (current) =>
+      current ? updater(current) : current,
+    );
+  };
+
+  const addTransaction = (
+    newTx: Omit<Transaction, "id" | "date" | "status">,
+  ) => {
     const tx: Transaction = {
       ...newTx,
       id: `t_${Date.now()}`,
       date: "Just now",
       status: "completed",
     };
-    setTransactions((prev) => [tx, ...prev]);
-    if (newTx.type === "sent") {
-      setBalance((prev) => prev - newTx.amount);
-    } else {
-      setBalance((prev) => prev + newTx.amount);
-    }
+    const amountChange = newTx.type === "sent" ? -newTx.amount : newTx.amount;
+    updatePortfolio((current) => ({
+      ...current,
+      balance: current.balance + amountChange,
+      transactions: [tx, ...current.transactions],
+    }));
   };
 
   const depositMutation = useMutation({
-    mutationFn: async ({ amount, method }: { amount: number, method: string }) => {
+    mutationFn: async ({
+      amount,
+      method,
+    }: {
+      amount: number;
+      method: string;
+    }) => {
       const res = await fetch(`${API_BASE_URL}/api/v1/anchor/deposit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           anchor_domain: method,
           asset_code: "USDC",
-          account: initialUser.stellarAddress
-        })
+          account: initialUser.stellarAddress,
+        }),
       });
       if (!res.ok) throw new Error("Deposit failed");
       return { amount, method };
@@ -55,18 +99,22 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
         type: "received",
         name: method,
         username: `@${method.toLowerCase().replace(" ", "")}`,
-        avatar: "https://images.unsplash.com/photo-1621761191319-c6fb62004040?auto=format&fit=crop&q=80&w=200&h=200",
+        avatar:
+          "https://images.unsplash.com/photo-1621761191319-c6fb62004040?auto=format&fit=crop&q=80&w=200&h=200",
         amount,
         note: `Deposited via ${method}`,
         date: "Just now",
         status: "completed",
       };
-      setTransactions((prev) => [tx, ...prev]);
-      setBalance((prev) => prev + amount);
+      updatePortfolio((current) => ({
+        ...current,
+        balance: current.balance + amount,
+        transactions: [tx, ...current.transactions],
+      }));
     },
     onError: (error) => {
       console.error(error);
-    }
+    },
   });
 
   const deposit = (amount: number, method: string) => {
@@ -74,15 +122,15 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
   };
 
   const withdrawMutation = useMutation({
-    mutationFn: async ({ amount, bank }: { amount: number, bank: string }) => {
+    mutationFn: async ({ amount, bank }: { amount: number; bank: string }) => {
       const res = await fetch(`${API_BASE_URL}/api/v1/anchor/withdraw`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           anchor_domain: bank,
           asset_code: "USDC",
-          account: initialUser.stellarAddress
-        })
+          account: initialUser.stellarAddress,
+        }),
       });
       if (!res.ok) throw new Error("Withdrawal failed");
       return { amount, bank };
@@ -93,18 +141,22 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
         type: "sent",
         name: bank,
         username: `@${bank.toLowerCase().replace(" ", "")}`,
-        avatar: "https://images.unsplash.com/photo-1621761191319-c6fb62004040?auto=format&fit=crop&q=80&w=200&h=200",
+        avatar:
+          "https://images.unsplash.com/photo-1621761191319-c6fb62004040?auto=format&fit=crop&q=80&w=200&h=200",
         amount,
         note: `Withdrew to ${bank}`,
         date: "Just now",
         status: "completed",
       };
-      setTransactions((prev) => [tx, ...prev]);
-      setBalance((prev) => prev - amount);
+      updatePortfolio((current) => ({
+        ...current,
+        balance: current.balance - amount,
+        transactions: [tx, ...current.transactions],
+      }));
     },
     onError: (error) => {
       console.error(error);
-    }
+    },
   });
 
   const withdraw = (amount: number, bank: string) => {
@@ -112,11 +164,22 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
   };
 
   return (
-    <WalletContext.Provider value={{ 
-      balance, transactions, addTransaction, deposit, withdraw, 
-      isDepositing: depositMutation.isPending, 
-      isWithdrawing: withdrawMutation.isPending 
-    }}>
+    <WalletContext.Provider
+      value={{
+        balance,
+        transactions,
+        addTransaction,
+        deposit,
+        withdraw,
+        isDepositing: depositMutation.isPending,
+        isWithdrawing: withdrawMutation.isPending,
+        isOffline,
+        isPortfolioUnavailable,
+        refreshPortfolio: async () => {
+          await portfolioQuery.refetch();
+        },
+      }}
+    >
       {children}
     </WalletContext.Provider>
   );
@@ -124,6 +187,7 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
 
 export const useWallet = () => {
   const context = useContext(WalletContext);
-  if (!context) throw new Error("useWallet must be used within a WalletProvider");
+  if (!context)
+    throw new Error("useWallet must be used within a WalletProvider");
   return context;
 };

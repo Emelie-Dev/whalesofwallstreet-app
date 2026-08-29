@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+use wow_engine::api::cors::build_cors_layer;
 
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -27,23 +27,6 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("Shutdown signal received, starting graceful shutdown");
-}
-
-fn build_cors_layer(config: &wow_engine::config::AppConfig) -> CorsLayer {
-    if config.allowed_cors_origins.is_empty() {
-        return CorsLayer::permissive();
-    }
-
-    let origins: Vec<_> = config
-        .allowed_cors_origins
-        .iter()
-        .filter_map(|o| o.parse().ok())
-        .collect();
-
-    CorsLayer::new()
-        .allow_origin(origins)
-        .allow_methods(Any)
-        .allow_headers(Any)
 }
 
 #[tokio::main]
@@ -164,29 +147,53 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(wow_engine::db::gc::run_historical_routes_gc(db));
     }
 
+    // Shared record of pools currently under suspected front-running
+    // attack (see wow_engine::mempool). Written by the mempool listener
+    // below, read by every RoutePlanner that shares this Arc — including
+    // the one the API layer builds per-request in api::create_router*.
+    let mempool_risk_registry = std::sync::Arc::new(wow_engine::mempool::PoolRiskRegistry::new());
+
     // Background task: periodically scans the liquidity graph for
     // arbitrage (negative-weight cycle) opportunities. Entirely read-only
     // and isolated from the request-serving path, so it never adds latency
     // to a live quote.
     let arbitrage_planner =
-        std::sync::Arc::new(wow_engine::router::RoutePlanner::new(config.clone()));
+        std::sync::Arc::new(wow_engine::router::RoutePlanner::with_risk_registry(
+            config.clone(),
+            mempool_risk_registry.clone(),
+        ));
     tokio::spawn(wow_engine::router::arbitrage::run_arbitrage_scanner(
         arbitrage_planner,
+    ));
+
+    // Background task: watches the Ethereum mempool over a WSS feed for
+    // pending transactions front-running our routes' pools, flagging them
+    // in `mempool_risk_registry` so live quotes widen slippage tolerance
+    // while an attack is in progress. A no-op (logs and returns) unless
+    // MEMPOOL_WSS_URL is configured.
+    tokio::spawn(wow_engine::mempool::listener::run_mempool_listener(
+        wow_engine::bridge::Chain::Ethereum,
+        config.clone(),
+        mempool_risk_registry.clone(),
     ));
 
     // 4. Initialize API router with CORS and configuration.
     let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
     let cors_layer = build_cors_layer(&config);
+    let sep38_client = std::sync::Arc::new(wow_engine::anchor::sep38::Sep38Client::new());
     let app = wow_engine::api::create_router_with_cache(
-        db,
         verifier,
-        tracker,
         request_timeout,
-        cluster_cache,
-        config.clone(),
+        wow_engine::api::RouterDeps {
+            db,
+            tracker,
+            cache: cluster_cache,
+            config: config.clone(),
+            sep38_client,
+            mempool_risk_registry,
+        },
     )
     .layer(cors_layer)
-    .layer(CorsLayer::permissive())
     .layer(TraceLayer::new_for_http());
 
     // 5. Bind TCP listener on configured port
@@ -205,9 +212,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("     - POST /api/v1/anchor/quote        (SEP-38 Anchor Quotes)");
     tracing::info!("     - POST /api/v1/admin/invalidate-cache (Cluster Cache Invalidation)");
 
-    // 6. Serve incoming TCP requests through Axum pipeline
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // 6. Serve incoming TCP requests through Axum pipeline. Connect-info is
+    //    threaded through so rate limiting can key on the real peer IP.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }

@@ -1,7 +1,9 @@
 import React from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { QueryClient } from "@tanstack/react-query";
+import { createAsyncStoragePersister } from "@tanstack/query-async-storage-persister";
+import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 
-const queryClient = new QueryClient();
 import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
@@ -22,12 +24,32 @@ import InvestScreen from "./src/screens/InvestScreen";
 import TransactionDetailScreen from "./src/screens/TransactionDetailScreen";
 import NotificationsScreen from "./src/screens/NotificationsScreen";
 
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      gcTime: 1000 * 60 * 60 * 24,
+    },
+  },
+});
+
+const asyncStoragePersister = createAsyncStoragePersister({
+  storage: AsyncStorage,
+  key: "wow-query-cache",
+});
+
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
 
-const tabIcons: Record<string, { active: string; inactive: string; rotation?: number }> = {
+const tabIcons: Record<
+  string,
+  { active: string; inactive: string; rotation?: number }
+> = {
   Home: { active: "home", inactive: "home-outline" },
-  Send: { active: "arrow-forward", inactive: "arrow-forward-outline", rotation: -45 },
+  Send: {
+    active: "arrow-forward",
+    inactive: "arrow-forward-outline",
+    rotation: -45,
+  },
   Activity: { active: "time", inactive: "time-outline" },
   Profile: { active: "person", inactive: "person-outline" },
 };
@@ -52,18 +74,26 @@ function HomeTabs() {
           const icons = tabIcons[route.name];
           const iconName = focused ? icons.active : icons.inactive;
           return (
-            <Ionicons 
-              name={iconName as any} 
-              size={20} 
+            <Ionicons
+              name={iconName as any}
+              size={20}
               color={color}
-              style={icons.rotation ? { transform: [{ rotate: `${icons.rotation}deg` }] } : undefined}
+              style={
+                icons.rotation
+                  ? { transform: [{ rotate: `${icons.rotation}deg` }] }
+                  : undefined
+              }
             />
           );
         },
       })}
     >
       <Tab.Screen name="Home" component={HomeScreen} />
-      <Tab.Screen name="Send" component={SendScreen} options={{ tabBarLabel: "Send" }} />
+      <Tab.Screen
+        name="Send"
+        component={SendScreen}
+        options={{ tabBarLabel: "Send" }}
+      />
       <Tab.Screen name="Activity" component={ActivityScreen} />
       <Tab.Screen name="Profile" component={ProfileScreen} />
     </Tab.Navigator>
@@ -83,7 +113,10 @@ function AppNavigator() {
           <Stack.Screen name="Withdraw" component={WithdrawScreen} />
           <Stack.Screen name="Save" component={SaveScreen} />
           <Stack.Screen name="Invest" component={InvestScreen} />
-          <Stack.Screen name="TransactionDetail" component={TransactionDetailScreen} />
+          <Stack.Screen
+            name="TransactionDetail"
+            component={TransactionDetailScreen}
+          />
           <Stack.Screen name="Notifications" component={NotificationsScreen} />
         </Stack.Navigator>
       </NavigationContainer>
@@ -93,7 +126,17 @@ function AppNavigator() {
 
 export default function App() {
   return (
-    <QueryClientProvider client={queryClient}>
+    <PersistQueryClientProvider
+      client={queryClient}
+      persistOptions={{
+        persister: asyncStoragePersister,
+        maxAge: 1000 * 60 * 60 * 24,
+        dehydrateOptions: {
+          shouldDehydrateQuery: (query) =>
+            query.queryKey[0] === "wallet-portfolio",
+        },
+      }}
+    >
       <SafeAreaProvider>
         <ThemeProvider>
           <WalletProvider>
@@ -101,6 +144,6 @@ export default function App() {
           </WalletProvider>
         </ThemeProvider>
       </SafeAreaProvider>
-    </QueryClientProvider>
+    </PersistQueryClientProvider>
   );
 }

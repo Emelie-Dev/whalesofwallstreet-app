@@ -43,6 +43,9 @@ pub struct AppConfig {
     /// replay protection survives restarts and redeploys.
     #[serde(default = "default_cctp_nonce_store_path")]
     pub cctp_nonce_store_path: String,
+    /// Stellar Horizon endpoint used to read wallet balances and payments.
+    #[serde(default = "default_stellar_horizon_url")]
+    pub stellar_horizon_url: String,
 
     // ── Gas Oracle ──────────────────────────────────────────────────
     /// API key for Etherscan gas-tracker requests. When set, appended as
@@ -72,10 +75,64 @@ pub struct AppConfig {
     /// Comma-separated list of allowed CORS origins (e.g.
     /// `"https://app.example.com,http://localhost:3000"`).
     ///
-    /// When non-empty, only requests from these origins are permitted.
-    /// When empty, CORS is fully permissive (local-dev mode).
-    #[serde(default)]
+    /// Only requests from these origins receive `Access-Control-Allow-Origin`
+    /// approval — there is no permissive fallback. Defaults to the web-app's
+    /// local dev server so `cargo run` works out of the box; override for
+    /// staging/prod with the real frontend origins.
+    #[serde(default = "default_allowed_cors_origins")]
     pub allowed_cors_origins: Vec<String>,
+
+    // ── Rate limiting ───────────────────────────────────────────────
+    /// Per-IP request budget, per 60-second window, applied to every route.
+    #[serde(default = "default_rate_limit_global_per_minute")]
+    pub rate_limit_global_per_minute: u32,
+    /// Per-IP request budget, per 60-second window, applied specifically to
+    /// `/api/v1/quote` on top of the global budget above — it runs a
+    /// non-trivial pathfinding search per request, so it gets a stricter
+    /// limit.
+    #[serde(default = "default_rate_limit_quote_per_minute")]
+    pub rate_limit_quote_per_minute: u32,
+    /// Whether the engine is deployed behind a reverse proxy/load balancer
+    /// that can be trusted to set `X-Forwarded-For` correctly.
+    ///
+    /// Defaults to `false`: an end client can set any `X-Forwarded-For`
+    /// value it likes, so trusting it unconditionally would let anyone
+    /// spoof their way around per-IP rate limiting. Rate limiting keys on
+    /// the real TCP peer address unless this is explicitly set to `true`
+    /// *and* the deployment topology actually guarantees that header is
+    /// overwritten/stripped by a trusted proxy before reaching this engine.
+    #[serde(default)]
+    pub trust_proxy_headers: bool,
+
+    // ── Mempool Front-Running Monitor ───────────────────────────────
+    /// WSS endpoint the mempool listener connects to for real-time
+    /// pending-transaction visibility on Ethereum mainnet, used to detect
+    /// front-running/sandwich activity against pools our routes trade
+    /// through. When unset, the listener does not start and routing
+    /// behaves exactly as it did before this monitor existed.
+    ///
+    /// Must support Alchemy's `alchemy_pendingTransactions` subscription
+    /// (address-filtered, full-transaction pending feed) — that server-side
+    /// filtering is what keeps the listener from decoding the entire
+    /// public mempool. This is an Alchemy-specific extension, not part of
+    /// the standard `eth_subscribe("newPendingTransactions")` every
+    /// provider implements, so a plain Infura (or other non-Alchemy)
+    /// endpoint here will have its subscription request rejected — the
+    /// listener will reconnect and log the rejection on every attempt
+    /// rather than silently doing nothing, but it will never see a
+    /// pending transaction. See `mempool::listener` for the reconnect/log
+    /// behavior.
+    #[serde(default)]
+    pub mempool_wss_url: Option<String>,
+    /// Extra contract addresses (DEX routers, the deBridge gateway, etc.)
+    /// the mempool listener should watch, beyond `cctp_message_transmitter`
+    /// which is always included. A pending call decodes into a *pool* (and
+    /// so can feed sandwich detection) only for the DEX-router swap
+    /// signatures this module knows how to parse — routers you want
+    /// covered must be listed here. Comma-separated in the
+    /// `MEMPOOL_WATCHED_CONTRACTS` env var.
+    #[serde(default)]
+    pub mempool_watched_contracts: Vec<String>,
 }
 
 fn default_port() -> u16 {
@@ -97,6 +154,24 @@ fn default_cctp_message_transmitter() -> String {
 
 fn default_cctp_nonce_store_path() -> String {
     "data/cctp_consumed_nonces.log".to_string()
+}
+
+fn default_allowed_cors_origins() -> Vec<String> {
+    // The web-app's Vite dev server (see web-app/package.json). Deployments
+    // must set ALLOWED_CORS_ORIGINS explicitly for staging/prod.
+    vec!["http://localhost:5173".to_string()]
+}
+
+fn default_rate_limit_global_per_minute() -> u32 {
+    300
+}
+
+fn default_rate_limit_quote_per_minute() -> u32 {
+    30
+}
+
+fn default_stellar_horizon_url() -> String {
+    "https://horizon-testnet.stellar.org".to_string()
 }
 
 fn default_allowed_anchor_domains() -> HashSet<String> {
@@ -122,10 +197,16 @@ impl Default for AppConfig {
             eth_rpc_url: default_eth_rpc_url(),
             cctp_message_transmitter: default_cctp_message_transmitter(),
             cctp_nonce_store_path: default_cctp_nonce_store_path(),
+            stellar_horizon_url: default_stellar_horizon_url(),
             etherscan_api_key: None,
             arbiscan_api_key: None,
             allowed_anchor_domains: default_allowed_anchor_domains(),
-            allowed_cors_origins: Vec::new(),
+            allowed_cors_origins: default_allowed_cors_origins(),
+            rate_limit_global_per_minute: default_rate_limit_global_per_minute(),
+            rate_limit_quote_per_minute: default_rate_limit_quote_per_minute(),
+            trust_proxy_headers: false,
+            mempool_wss_url: None,
+            mempool_watched_contracts: Vec::new(),
         }
     }
 }
@@ -147,5 +228,20 @@ impl AppConfig {
     /// Wraps `self` in an `Arc` for cheap cloning across async tasks.
     pub fn into_arc(self) -> Arc<Self> {
         Arc::new(self)
+    }
+
+    /// Every contract address the mempool listener should subscribe to,
+    /// lowercased and deduplicated: `cctp_message_transmitter` plus any
+    /// operator-configured `mempool_watched_contracts`.
+    pub fn watched_mempool_contracts(&self) -> Vec<String> {
+        let mut set: HashSet<String> = self
+            .mempool_watched_contracts
+            .iter()
+            .map(|a| a.to_lowercase())
+            .collect();
+        set.insert(self.cctp_message_transmitter.to_lowercase());
+        let mut contracts: Vec<String> = set.into_iter().collect();
+        contracts.sort();
+        contracts
     }
 }
