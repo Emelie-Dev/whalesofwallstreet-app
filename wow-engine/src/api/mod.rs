@@ -10,6 +10,7 @@ use crate::db::models::RouteExecutionInput;
 use crate::db::service::{ExecuteRouteResult, RouteExecutionService};
 use crate::db::Database;
 use crate::error::AppError;
+use crate::mempool::PoolRiskRegistry;
 use crate::router::slippage::SlippageError;
 use crate::router::{RouteOption, RoutePlanner};
 use axum::{
@@ -201,6 +202,7 @@ pub fn create_router(db: Option<Database>, verifier: Option<SignatureVerifier>) 
         ClusterCache::local_only(),
         Arc::new(AppConfig::default()),
         Arc::new(Sep38Client::new()),
+        Arc::new(PoolRiskRegistry::new()),
     )
 }
 
@@ -212,6 +214,7 @@ pub fn create_router_with_cache(
     cache: ClusterCache,
     config: Arc<AppConfig>,
     sep38_client: Arc<Sep38Client>,
+    mempool_risk_registry: Arc<PoolRiskRegistry>,
 ) -> Router {
     // Every route shares a global per-IP budget; `/api/v1/quote` additionally
     // gets its own, stricter budget since it runs a non-trivial pathfinding
@@ -258,6 +261,7 @@ pub fn create_router_with_cache(
         .layer(Extension(config))
         .layer(Extension(tracker))
         .layer(Extension(sep38_client))
+        .layer(Extension(mempool_risk_registry))
         .layer(axum::middleware::from_fn_with_state(
             global_limiter,
             rate_limit::rate_limit_middleware,
@@ -376,6 +380,7 @@ async fn portfolio_handler(
 #[tracing::instrument(err)]
 async fn quote_handler(
     Extension(config): Extension<Arc<AppConfig>>,
+    Extension(risk_registry): Extension<Arc<PoolRiskRegistry>>,
     Json(payload): Json<QuoteRequest>,
 ) -> Result<Json<QuoteResponse>, AppError> {
     if payload.source_asset.trim().is_empty() {
@@ -394,7 +399,7 @@ async fn quote_handler(
         ));
     }
 
-    let planner = RoutePlanner::new(config);
+    let planner = RoutePlanner::with_risk_registry(config, risk_registry);
     let routes = planner
         .find_best_route(
             payload.source_chain,

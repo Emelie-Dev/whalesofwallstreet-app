@@ -311,6 +311,7 @@ mod anchor_deposit_withdraw_success {
             ClusterCache::local_only(),
             Arc::new(AppConfig::default()),
             Arc::new(Sep38Client::new()),
+            Arc::new(wow_engine::mempool::PoolRiskRegistry::new()),
         ))
     }
 

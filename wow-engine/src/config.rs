@@ -103,6 +103,36 @@ pub struct AppConfig {
     /// overwritten/stripped by a trusted proxy before reaching this engine.
     #[serde(default)]
     pub trust_proxy_headers: bool,
+
+    // ── Mempool Front-Running Monitor ───────────────────────────────
+    /// WSS endpoint the mempool listener connects to for real-time
+    /// pending-transaction visibility on Ethereum mainnet, used to detect
+    /// front-running/sandwich activity against pools our routes trade
+    /// through. When unset, the listener does not start and routing
+    /// behaves exactly as it did before this monitor existed.
+    ///
+    /// Must support Alchemy's `alchemy_pendingTransactions` subscription
+    /// (address-filtered, full-transaction pending feed) — that server-side
+    /// filtering is what keeps the listener from decoding the entire
+    /// public mempool. This is an Alchemy-specific extension, not part of
+    /// the standard `eth_subscribe("newPendingTransactions")` every
+    /// provider implements, so a plain Infura (or other non-Alchemy)
+    /// endpoint here will have its subscription request rejected — the
+    /// listener will reconnect and log the rejection on every attempt
+    /// rather than silently doing nothing, but it will never see a
+    /// pending transaction. See `mempool::listener` for the reconnect/log
+    /// behavior.
+    #[serde(default)]
+    pub mempool_wss_url: Option<String>,
+    /// Extra contract addresses (DEX routers, the deBridge gateway, etc.)
+    /// the mempool listener should watch, beyond `cctp_message_transmitter`
+    /// which is always included. A pending call decodes into a *pool* (and
+    /// so can feed sandwich detection) only for the DEX-router swap
+    /// signatures this module knows how to parse — routers you want
+    /// covered must be listed here. Comma-separated in the
+    /// `MEMPOOL_WATCHED_CONTRACTS` env var.
+    #[serde(default)]
+    pub mempool_watched_contracts: Vec<String>,
 }
 
 fn default_port() -> u16 {
@@ -175,6 +205,8 @@ impl Default for AppConfig {
             rate_limit_global_per_minute: default_rate_limit_global_per_minute(),
             rate_limit_quote_per_minute: default_rate_limit_quote_per_minute(),
             trust_proxy_headers: false,
+            mempool_wss_url: None,
+            mempool_watched_contracts: Vec::new(),
         }
     }
 }
@@ -196,5 +228,20 @@ impl AppConfig {
     /// Wraps `self` in an `Arc` for cheap cloning across async tasks.
     pub fn into_arc(self) -> Arc<Self> {
         Arc::new(self)
+    }
+
+    /// Every contract address the mempool listener should subscribe to,
+    /// lowercased and deduplicated: `cctp_message_transmitter` plus any
+    /// operator-configured `mempool_watched_contracts`.
+    pub fn watched_mempool_contracts(&self) -> Vec<String> {
+        let mut set: HashSet<String> = self
+            .mempool_watched_contracts
+            .iter()
+            .map(|a| a.to_lowercase())
+            .collect();
+        set.insert(self.cctp_message_transmitter.to_lowercase());
+        let mut contracts: Vec<String> = set.into_iter().collect();
+        contracts.sort();
+        contracts
     }
 }
