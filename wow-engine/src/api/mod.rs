@@ -30,7 +30,7 @@ pub mod rate_limit;
 pub mod validation;
 use auth::SignatureVerifier;
 use rate_limit::RateLimiter;
-use validation::{validate_asset_code, validate_stellar_address};
+use validation::{validate_anchor_domain, validate_asset_code, validate_stellar_address};
 
 #[derive(Deserialize, Debug)]
 pub struct QuoteRequest {
@@ -492,9 +492,10 @@ async fn withdraw_handler(
     Ok(Json(tx))
 }
 
-#[tracing::instrument(skip(client), err)]
+#[tracing::instrument(skip(client, config), err)]
 async fn anchor_quote_handler(
     Extension(client): Extension<Arc<Sep38Client>>,
+    Extension(config): Extension<Arc<AppConfig>>,
     Json(payload): Json<AnchorQuoteRequest>,
 ) -> Result<Json<Sep38Quote>, AppError> {
     if let Err(err) = validate_asset_code(&payload.sell_asset) {
@@ -508,15 +509,19 @@ async fn anchor_quote_handler(
             "Sell amount must be greater than zero".to_string(),
         ));
     }
-    if payload.anchor_domain.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "Anchor domain cannot be empty".to_string(),
-        ));
-    }
+    // `fetch_anchor_price` (inside `get_indicative_quote`) makes a live
+    // outbound HTTP request to this domain, and `/api/v1/anchor/quote` is
+    // unauthenticated (PUBLIC_PATHS) — without this check, any caller could
+    // point anchor_domain at an internal host or a cloud metadata address
+    // and have us fetch it for them. Same allowlist + SSRF guard already
+    // enforced by deposit/withdraw's anchor-domain handling.
+    let anchor_domain =
+        validate_anchor_domain(&payload.anchor_domain, &config.allowed_anchor_domains)
+            .map_err(AppError::BadRequest)?;
 
     let quote = client
         .get_indicative_quote(
-            &payload.anchor_domain,
+            &anchor_domain,
             &payload.sell_asset,
             &payload.buy_asset,
             payload.sell_amount,

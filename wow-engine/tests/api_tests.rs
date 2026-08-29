@@ -215,51 +215,61 @@ async fn test_anchor_quote_invalid_amount() {
     assert!(err_msg.contains("Sell amount must be greater than zero"));
 }
 
+/// Regression coverage for the SSRF closed by threading `AppConfig` (and
+/// its `allowed_anchor_domains` allowlist) into `anchor_quote_handler`:
+/// `fetch_anchor_price` makes a live outbound HTTP request to whatever
+/// `anchor_domain` the (unauthenticated — see `auth::PUBLIC_PATHS`) caller
+/// supplies, so the handler must reject anything not allowlisted, and must
+/// reject a raw IP address even if it somehow were allowlisted.
+///
+/// A genuine 200 end-to-end through this handler needs an `anchor_domain`
+/// that is both allowlisted *and* resolves to a mock server — the
+/// allowlist works on domain names, not IPs, and there's no DNS mocking in
+/// this test harness, so that combination isn't available here. The live
+/// pricing fetch itself (success + fallback-provider paths) is covered at
+/// the `Sep38Client` level in `src/anchor/sep38.rs`'s own tests, which
+/// call `get_indicative_quote` directly and so aren't subject to (or
+/// testing) this handler-level allowlist.
 #[tokio::test]
-async fn test_anchor_quote_endpoint_success() {
-    // Sep38Client is stateless (no DB dependency), so this success path
-    // runs unconditionally, unlike the deposit/withdraw success tests below.
-    //
-    // The handler now sources its price from a live call to the anchor's
-    // SEP-38 `/price` endpoint (see issue #51), so this points the request
-    // at a mock anchor rather than asserting a hardcoded literal.
-    let mock_anchor = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/sep38/price"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({ "price": "1500.0000000" })),
-        )
-        .mount(&mock_anchor)
-        .await;
-
-    let app = create_router_with_cache(
-        None,
-        None,
-        None,
-        std::time::Duration::from_secs(30),
-        wow_engine::cache_sync::ClusterCache::local_only(),
-        std::sync::Arc::new(wow_engine::config::AppConfig::default()),
-        std::sync::Arc::new(wow_engine::anchor::sep38::Sep38Client::new()),
-    );
+async fn test_anchor_quote_endpoint_rejects_non_allowlisted_domain() {
+    let app = create_router(None, None);
     let server = TestServer::new(app).unwrap();
 
     let payload = json!({
-        "anchor_domain": mock_anchor.uri(),
+        "anchor_domain": "attacker-controlled.example",
         "sell_asset": "USDC",
         "buy_asset": "NGN",
         "sell_amount": 100.0
     });
 
     let response = server.post("/api/v1/anchor/quote").json(&payload).await;
-    response.assert_status_ok();
+    response.assert_status_bad_request();
+    assert!(response.text().contains("not allowlisted"));
+}
 
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["sell_asset"], "USDC");
-    assert_eq!(body["buy_asset"], "NGN");
-    assert_eq!(body["price"], "1500.0000000");
-    assert_eq!(body["buy_amount"], "150000.0000000");
-    assert!(body["id"].as_str().unwrap().starts_with("q_sep38_"));
+#[tokio::test]
+async fn test_anchor_quote_endpoint_rejects_ip_address_as_domain() {
+    // The literal SSRF vector: pointing anchor_domain at a raw IP (e.g. an
+    // internal host or a cloud metadata address like 169.254.169.254)
+    // instead of a hostname. With the real default config this is rejected
+    // by the allowlist check before the IP-format check ever runs — a bare
+    // IP is never allowlisted in practice — which is itself sufficient
+    // protection. `validation.rs`'s own tests cover the deeper IP-format
+    // rejection directly, for the case where an IP was mistakenly
+    // allowlisted.
+    let app = create_router(None, None);
+    let server = TestServer::new(app).unwrap();
+
+    let payload = json!({
+        "anchor_domain": "169.254.169.254",
+        "sell_asset": "USDC",
+        "buy_asset": "NGN",
+        "sell_amount": 100.0
+    });
+
+    let response = server.post("/api/v1/anchor/quote").json(&payload).await;
+    response.assert_status_bad_request();
+    assert!(response.text().contains("not allowlisted"));
 }
 
 /// Success-path tests for the anchor deposit/withdraw endpoints. These

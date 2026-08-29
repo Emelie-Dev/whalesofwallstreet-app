@@ -3,6 +3,7 @@ use axum::http::{header, Request, StatusCode};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt; // for `oneshot`
+use wow_engine::anchor::sep38::Sep38Client;
 use wow_engine::api::cors::build_cors_layer;
 use wow_engine::api::{create_router, create_router_with_cache};
 use wow_engine::cache_sync::ClusterCache;
@@ -42,6 +43,7 @@ fn router_with_config(config: AppConfig) -> axum::Router {
         Duration::from_secs(30),
         ClusterCache::local_only(),
         Arc::new(config),
+        Arc::new(Sep38Client::new()),
     )
 }
 
